@@ -1,0 +1,517 @@
+import os
+import uuid
+import zipfile
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Query, status
+from sqlalchemy.orm import Session, joinedload
+
+from backend.app.config import settings
+from backend.app.database import get_db
+from backend.app.models import Donation, Donor, BankStatementEntry, TaxReceipt80G, DonationStatus
+from backend.app.schemas import (
+    DonationResponse, DonationUpdate, PublicDonationSubmissionResponse, DonorResponse, 
+    VerifyDonationRequest, to_pydantic
+)
+from backend.app.services.storage_service import StorageService
+from backend.app.services.ocr_service import OCRService
+from backend.app.services.reconciliation_service import ReconciliationService
+from backend.app.services.receipt_service import ReceiptService
+from backend.app.services.anti_fraud_service import ScreenshotFraudDetector
+from backend.app.services.notification_service import NotificationService
+from backend.app.utils.validators import normalize_indian_phone, validate_pan_format
+
+router = APIRouter(prefix="/donations", tags=["Donations"])
+
+
+@router.post("/public-submit", response_model=PublicDonationSubmissionResponse, status_code=status.HTTP_201_CREATED)
+async def public_submit_donation(
+    background_tasks: BackgroundTasks,
+    full_name: str = Form(...),
+    pan_number: str = Form(...),
+    phone: str = Form(...),
+    email: str = Form(...),
+    address: Optional[str] = Form(None),
+    amount_paid: Optional[float] = Form(None),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    """
+    Public Donor Portal endpoint with Anti-Fraud Inspection:
+    1. Validates PAN & normalizes phone to E.164 (+91XXXXXXXXXX).
+    2. Computes SHA-256 file hash to block recycled/duplicate screenshots.
+    3. Runs Error Level Analysis (ELA) to detect photoshopped amounts/UTRs.
+    4. Executes OCR to extract 12-digit UTR and verifies Julian date / syntax.
+    5. Flags fraud or saves donation and enqueues bank reconciliation.
+    """
+    # 1. Validate PAN & normalize phone
+    try:
+        pan_cleaned = validate_pan_format(pan_number)
+        norm_phone = normalize_indian_phone(phone)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # 2. Read file bytes for hash and fraud inspection
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    # 3. Compute SHA-256 file hash
+    file_sha256 = ScreenshotFraudDetector.calculate_file_hash(image_bytes)
+
+    fraud_reasons = []
+    is_flagged_fraud = False
+
+    # Check byte-level duplicate recycling
+    duplicate_hash_entry = db.query(Donation).filter(Donation.image_sha256 == file_sha256).first()
+    if duplicate_hash_entry:
+        is_flagged_fraud = True
+        fraud_reasons.append("DUPLICATE_FILE_HASH: Identical screenshot bytes already submitted in system.")
+
+    # 4. Error Level Analysis (ELA)
+    ela_res = ScreenshotFraudDetector.run_error_level_analysis(image_bytes)
+    tamper_score = ela_res.get("tamper_score", 0.0)
+    ela_base64 = ela_res.get("ela_base64", "")
+    if ela_res.get("is_tampered"):
+        is_flagged_fraud = True
+        fraud_reasons.append(f"HIGH_ELA_SCORE: Error Level Analysis detected localized image tampering (Score: {tamper_score}%).")
+
+    # 5. Get or create Donor
+    donor = db.query(Donor).filter(Donor.pan_number == pan_cleaned).first()
+    if not donor:
+        donor = Donor(
+            id=uuid.uuid4(),
+            full_name=full_name.strip(),
+            pan_number=pan_cleaned,
+            phone=norm_phone,
+            email=email.strip().lower(),
+            address=address.strip() if address else None
+        )
+        db.add(donor)
+        db.flush()
+    else:
+        donor.full_name = full_name.strip()
+        donor.phone = norm_phone
+        donor.email = email.strip().lower()
+        if address:
+            donor.address = address.strip()
+
+    # 6. Save Screenshot to disk
+    rel_url, saved_path = StorageService.save_bytes(image_bytes, file.filename, settings.SCREENSHOTS_DIR)
+
+    # 7. OCR Extraction
+    ocr_result = OCRService.process_screenshot(str(saved_path), file.filename)
+    extracted_utr = ocr_result.get("extracted_utr")
+    extracted_amt = ocr_result.get("extracted_amount")
+    if amount_paid and not extracted_amt:
+        extracted_amt = amount_paid
+
+    extracted_date = None
+    if ocr_result.get("extracted_date"):
+        try:
+            extracted_date = datetime.fromisoformat(ocr_result["extracted_date"])
+        except Exception:
+            extracted_date = datetime.now(timezone.utc)
+
+    # 8. UTR Syntax & Julian Date Validation
+    if extracted_utr:
+        utr_check = ScreenshotFraudDetector.validate_utr_syntax(extracted_utr)
+        if not utr_check["is_valid"]:
+            is_flagged_fraud = True
+            fraud_reasons.append(f"INVALID_UTR_SYNTAX: {utr_check['rejection_reason']}")
+
+    # Determine status
+    if is_flagged_fraud:
+        status_val = DonationStatus.FLAGGED_REVIEW
+        flagged_reason = " | ".join(fraud_reasons)
+    else:
+        status_val = DonationStatus(ocr_result.get("status", "EXTRACTED"))
+        flagged_reason = None
+
+    # 9. Create Donation record
+    donation = Donation(
+        id=uuid.uuid4(),
+        donor_id=donor.id,
+        screenshot_url=rel_url,
+        extracted_utr=extracted_utr,
+        extracted_amount=Decimal(str(extracted_amt)) if extracted_amt else None,
+        extracted_date=extracted_date,
+        raw_ocr_payload=ocr_result,
+        ocr_confidence=ocr_result.get("confidence", 0.85),
+        status=status_val,
+        is_verified=False,
+        flagged_reason=flagged_reason,
+        # Anti-fraud fields
+        image_sha256=file_sha256,
+        tamper_score=tamper_score,
+        ela_heatmap_url=ela_base64,
+        is_flagged_fraud=is_flagged_fraud,
+        fraud_reasons=fraud_reasons
+    )
+    db.add(donation)
+    db.commit()
+    db.refresh(donation)
+
+    # 10. Run auto reconciliation in background if not fraudulent
+    if not is_flagged_fraud:
+        background_tasks.add_task(ReconciliationService.run_reconciliation, db)
+
+    return PublicDonationSubmissionResponse(
+        tracking_id=donation.id,
+        donor=to_pydantic(DonorResponse, donor),
+        donation_id=donation.id,
+        extracted_utr=donation.extracted_utr,
+        extracted_amount=donation.extracted_amount,
+        status=donation.status,
+        is_flagged_fraud=donation.is_flagged_fraud,
+        tamper_score=donation.tamper_score,
+        fraud_reasons=donation.fraud_reasons,
+        message="Thank you! Your donation proof has been received. Your 80G tax certificate will be sent to your WhatsApp and email upon bank clearance."
+    )
+
+
+@router.post("/bulk-upload", response_model=List[DonationResponse])
+async def bulk_upload_screenshots(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db)
+):
+    """
+    Admin Bulk Screenshot Upload endpoint with Anti-Fraud Inspection.
+    """
+    created_donations = []
+
+    for f in files:
+        filename_lower = f.filename.lower()
+        
+        # Check if zip archive
+        if filename_lower.endswith(".zip"):
+            file_bytes = await f.read()
+            import io
+            with zipfile.ZipFile(io.BytesIO(file_bytes), 'r') as zip_ref:
+                for member in zip_ref.namelist():
+                    if member.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')) and not member.startswith('__MACOSX'):
+                        img_data = zip_ref.read(member)
+                        member_name = os.path.basename(member)
+                        
+                        # Anti-fraud analysis
+                        sha256_hash = ScreenshotFraudDetector.calculate_file_hash(img_data)
+                        ela_res = ScreenshotFraudDetector.run_error_level_analysis(img_data)
+                        
+                        fraud_reasons = []
+                        is_fraud = False
+                        if db.query(Donation).filter(Donation.image_sha256 == sha256_hash).first():
+                            is_fraud = True
+                            fraud_reasons.append("DUPLICATE_FILE_HASH: Identical screenshot bytes already submitted in system.")
+                        if ela_res.get("is_tampered"):
+                            is_fraud = True
+                            fraud_reasons.append(f"HIGH_ELA_SCORE: Tampering detected (Score: {ela_res.get('tamper_score')}%)")
+
+                        rel_url, img_path = StorageService.save_bytes(img_data, member_name, settings.SCREENSHOTS_DIR)
+                        ocr_res = OCRService.process_screenshot(str(img_path), member_name)
+
+                        extracted_utr = ocr_res.get("extracted_utr")
+                        if extracted_utr:
+                            utr_syntax = ScreenshotFraudDetector.validate_utr_syntax(extracted_utr)
+                            if not utr_syntax["is_valid"]:
+                                is_fraud = True
+                                fraud_reasons.append(f"INVALID_UTR_SYNTAX: {utr_syntax['rejection_reason']}")
+
+                        donation = Donation(
+                            id=uuid.uuid4(),
+                            screenshot_url=rel_url,
+                            extracted_utr=extracted_utr,
+                            extracted_amount=Decimal(str(ocr_res["extracted_amount"])) if ocr_res.get("extracted_amount") else None,
+                            raw_ocr_payload=ocr_res,
+                            ocr_confidence=ocr_res.get("confidence", 0.85),
+                            status=DonationStatus.FLAGGED_REVIEW if is_fraud else DonationStatus(ocr_res.get("status", "EXTRACTED")),
+                            is_verified=False,
+                            image_sha256=sha256_hash,
+                            tamper_score=ela_res.get("tamper_score", 0.0),
+                            ela_heatmap_url=ela_res.get("ela_base64", ""),
+                            is_flagged_fraud=is_fraud,
+                            fraud_reasons=fraud_reasons,
+                            flagged_reason=" | ".join(fraud_reasons) if fraud_reasons else None
+                        )
+                        db.add(donation)
+                        created_donations.append(donation)
+        elif filename_lower.endswith(('.png', '.jpg', '.jpeg', '.webp')):
+            img_data = await f.read()
+            sha256_hash = ScreenshotFraudDetector.calculate_file_hash(img_data)
+            ela_res = ScreenshotFraudDetector.run_error_level_analysis(img_data)
+            
+            fraud_reasons = []
+            is_fraud = False
+            if db.query(Donation).filter(Donation.image_sha256 == sha256_hash).first():
+                is_fraud = True
+                fraud_reasons.append("DUPLICATE_FILE_HASH: Identical screenshot bytes already submitted in system.")
+            if ela_res.get("is_tampered"):
+                is_fraud = True
+                fraud_reasons.append(f"HIGH_ELA_SCORE: Tampering detected (Score: {ela_res.get('tamper_score')}%)")
+
+            rel_url, img_path = StorageService.save_bytes(img_data, f.filename, settings.SCREENSHOTS_DIR)
+            ocr_res = OCRService.process_screenshot(str(img_path), f.filename)
+
+            extracted_utr = ocr_res.get("extracted_utr")
+            if extracted_utr:
+                utr_syntax = ScreenshotFraudDetector.validate_utr_syntax(extracted_utr)
+                if not utr_syntax["is_valid"]:
+                    is_fraud = True
+                    fraud_reasons.append(f"INVALID_UTR_SYNTAX: {utr_syntax['rejection_reason']}")
+
+            donation = Donation(
+                id=uuid.uuid4(),
+                screenshot_url=rel_url,
+                extracted_utr=extracted_utr,
+                extracted_amount=Decimal(str(ocr_res["extracted_amount"])) if ocr_res.get("extracted_amount") else None,
+                raw_ocr_payload=ocr_res,
+                ocr_confidence=ocr_res.get("confidence", 0.85),
+                status=DonationStatus.FLAGGED_REVIEW if is_fraud else DonationStatus(ocr_res.get("status", "EXTRACTED")),
+                is_verified=False,
+                image_sha256=sha256_hash,
+                tamper_score=ela_res.get("tamper_score", 0.0),
+                ela_heatmap_url=ela_res.get("ela_base64", ""),
+                is_flagged_fraud=is_fraud,
+                fraud_reasons=fraud_reasons,
+                flagged_reason=" | ".join(fraud_reasons) if fraud_reasons else None
+            )
+            db.add(donation)
+            created_donations.append(donation)
+
+    db.commit()
+    for d in created_donations:
+        db.refresh(d)
+
+    background_tasks.add_task(ReconciliationService.run_reconciliation, db)
+    return created_donations
+
+
+@router.get("/", response_model=List[DonationResponse])
+def list_donations(
+    status: Optional[str] = Query(None, description="Filter by status (MATCHED, EXTRACTED, FLAGGED_REVIEW, REJECTED)"),
+    is_verified: Optional[bool] = Query(None),
+    is_flagged_fraud: Optional[bool] = Query(None),
+    search: Optional[str] = Query(None, description="Search by UTR or Donor Name / PAN"),
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db)
+):
+    query = db.query(Donation).options(
+        joinedload(Donation.donor),
+        joinedload(Donation.matched_statement),
+        joinedload(Donation.tax_receipt)
+    )
+
+    if status and status.upper() != "ALL":
+        try:
+            enum_status = DonationStatus(status.upper())
+            query = query.filter(Donation.status == enum_status)
+        except ValueError:
+            pass
+
+    if is_verified is not None:
+        query = query.filter(Donation.is_verified == is_verified)
+
+    if is_flagged_fraud is not None:
+        query = query.filter(Donation.is_flagged_fraud == is_flagged_fraud)
+
+    if search:
+        s = f"%{search.strip()}%"
+        query = query.join(Donation.donor, isouter=True).filter(
+            (Donation.extracted_utr.ilike(s)) |
+            (Donor.full_name.ilike(s)) |
+            (Donor.pan_number.ilike(s))
+        )
+
+    return query.order_by(Donation.created_at.desc()).offset(offset).limit(limit).all()
+
+
+@router.get("/{donation_id}", response_model=DonationResponse)
+def get_donation(donation_id: uuid.UUID, db: Session = Depends(get_db)):
+    donation = db.query(Donation).options(
+        joinedload(Donation.donor),
+        joinedload(Donation.matched_statement),
+        joinedload(Donation.tax_receipt)
+    ).filter(Donation.id == donation_id).first()
+
+    if not donation:
+        raise HTTPException(status_code=404, detail="Donation record not found")
+    return donation
+
+
+@router.patch("/{donation_id}", response_model=DonationResponse)
+def update_donation(
+    donation_id: uuid.UUID,
+    payload: DonationUpdate,
+    db: Session = Depends(get_db)
+):
+    """
+    Inline edit & save endpoint for admin to correct misread OCR digits and record audit notes.
+    Re-validates UTR syntax and triggers reconciliation.
+    """
+    donation = db.query(Donation).filter(Donation.id == donation_id).first()
+    if not donation:
+        raise HTTPException(status_code=404, detail="Donation record not found")
+
+    if payload.extracted_utr is not None:
+        clean_utr = payload.extracted_utr.strip()
+        donation.extracted_utr = clean_utr
+        # Validate syntax
+        utr_check = ScreenshotFraudDetector.validate_utr_syntax(clean_utr)
+        if not utr_check["is_valid"]:
+            donation.is_flagged_fraud = True
+            reasons = list(donation.fraud_reasons or [])
+            reasons.append(f"INVALID_UTR_SYNTAX: {utr_check['rejection_reason']}")
+            donation.fraud_reasons = reasons
+            donation.flagged_reason = utr_check["rejection_reason"]
+        else:
+            # If previously flagged only for UTR, clear
+            reasons = [r for r in (donation.fraud_reasons or []) if not r.startswith("INVALID_UTR_SYNTAX")]
+            donation.fraud_reasons = reasons
+            if not reasons:
+                donation.is_flagged_fraud = False
+                donation.flagged_reason = None
+
+    if payload.extracted_amount is not None:
+        donation.extracted_amount = payload.extracted_amount
+    if payload.extracted_date is not None:
+        donation.extracted_date = payload.extracted_date
+    if payload.status is not None:
+        donation.status = payload.status
+    if payload.is_verified is not None:
+        donation.is_verified = payload.is_verified
+    if payload.flagged_reason is not None:
+        donation.flagged_reason = payload.flagged_reason
+    if payload.matched_statement_id is not None:
+        donation.matched_statement_id = payload.matched_statement_id
+    if payload.admin_audit_notes is not None:
+        donation.admin_audit_notes = payload.admin_audit_notes
+
+    donation.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    # Re-evaluate reconciliation live
+    ReconciliationService.run_reconciliation(db)
+
+    db.refresh(donation)
+    return donation
+
+
+@router.post("/{donation_id}/verify", response_model=DonationResponse)
+def verify_donation(
+    donation_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
+    payload: Optional[VerifyDonationRequest] = None,
+    verified_by_user: Optional[str] = Query(None),
+    admin_audit_notes: Optional[str] = Query(None),
+    bank_matched_mode: Optional[str] = Query(None),
+    db: Session = Depends(get_db)
+):
+    """
+    Mark as Verified (with CA Audit Trail, Double-Issuance Block, & WhatsApp Dispatch):
+    1. Enforces uniqueness: Blocks double 80G issuance against the same verified UTR.
+    2. Logs CA Auditor identity, audit notes, verification timestamp, and match mode.
+    3. Issues Section 80G Tax Exemption Certificate PDF.
+    4. Dispatches receipt via WhatsApp to donor's mobile number in background.
+    """
+    donation = db.query(Donation).options(
+        joinedload(Donation.donor),
+        joinedload(Donation.matched_statement),
+        joinedload(Donation.tax_receipt)
+    ).filter(Donation.id == donation_id).first()
+
+    if not donation:
+        raise HTTPException(status_code=404, detail="Donation not found")
+
+    # 1. Double Issuance Guard
+    if donation.extracted_utr:
+        duplicate_verified = db.query(Donation).filter(
+            Donation.extracted_utr == donation.extracted_utr,
+            Donation.is_verified == True,
+            Donation.id != donation.id
+        ).first()
+        if duplicate_verified:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Double issuance blocked! Section 80G certificate has already been issued for UTR '{donation.extracted_utr}' on donation record {duplicate_verified.id}."
+            )
+
+    # 2. Update status and audit trail
+    donation.is_verified = True
+    donation.status = DonationStatus.MATCHED
+    donation.flagged_reason = None
+    donation.is_flagged_fraud = False
+
+    # CA Audit Trail
+    verifier = (payload and payload.verified_by_user) or verified_by_user or "CA Auditor / Admin"
+    notes = (payload and payload.admin_audit_notes) or admin_audit_notes or "Verified against official bank credit"
+    mode = (payload and payload.bank_matched_mode) or bank_matched_mode or "MANUAL_OVERRIDE"
+
+    donation.verified_by_user = verifier
+    donation.verified_at = datetime.now(timezone.utc)
+    donation.bank_matched_mode = mode
+    donation.admin_audit_notes = notes
+
+    if donation.matched_statement:
+        donation.matched_statement.is_reconciled = True
+
+    # 3. Generate 80G Tax Receipt
+    if donation.donor and not donation.tax_receipt:
+        receipt_count = db.query(TaxReceipt80G).count() + 1
+        receipt_no = ReceiptService.generate_receipt_number(receipt_count)
+        
+        pdf_path = ReceiptService.generate_80g_pdf(donation, donation.donor, receipt_no)
+        pdf_url = f"/api/receipts/download/{receipt_no.replace('/', '_')}.pdf"
+
+        tax_rec = TaxReceipt80G(
+            id=uuid.uuid4(),
+            donation_id=donation.id,
+            receipt_number=receipt_no,
+            financial_year=settings.CURRENT_FINANCIAL_YEAR,
+            eligible_amount=donation.extracted_amount or Decimal("0.0"),
+            pdf_path=str(pdf_path),
+            pdf_url=pdf_url
+        )
+        db.add(tax_rec)
+        db.flush()
+
+        # 4. Enqueue WhatsApp Notification to Donor
+        if donation.donor.phone:
+            background_tasks.add_task(
+                NotificationService.send_whatsapp_80g_receipt,
+                phone=donation.donor.phone,
+                donor_name=donation.donor.full_name,
+                receipt_url=pdf_url,
+                amount=float(donation.extracted_amount or 0.0),
+                receipt_number=receipt_no
+            )
+
+    db.commit()
+    db.refresh(donation)
+    return donation
+
+
+@router.post("/{donation_id}/reject", response_model=DonationResponse)
+def reject_donation(
+    donation_id: uuid.UUID,
+    reason: Optional[str] = Query("Marked as invalid / duplicate by admin"),
+    db: Session = Depends(get_db)
+):
+    donation = db.query(Donation).filter(Donation.id == donation_id).first()
+    if not donation:
+        raise HTTPException(status_code=404, detail="Donation not found")
+
+    donation.status = DonationStatus.REJECTED
+    donation.is_verified = False
+    donation.flagged_reason = reason
+    
+    if donation.matched_statement_id:
+        st = db.query(BankStatementEntry).filter(BankStatementEntry.id == donation.matched_statement_id).first()
+        if st:
+            st.is_reconciled = False
+        donation.matched_statement_id = None
+
+    db.commit()
+    db.refresh(donation)
+    return donation
