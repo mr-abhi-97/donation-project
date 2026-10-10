@@ -1,5 +1,6 @@
 import uuid
 import enum
+from typing import Optional
 from datetime import datetime, timezone
 from sqlalchemy import (
     Column,
@@ -68,9 +69,11 @@ class UniversalJSON(TypeDecorator):
 
 
 class DonationStatus(str, enum.Enum):
+    PENDING = "PENDING"
     PENDING_OCR = "PENDING_OCR"
     EXTRACTED = "EXTRACTED"
     MATCHED = "MATCHED"
+    SUCCESS = "SUCCESS"
     FLAGGED_REVIEW = "FLAGGED_REVIEW"
     REJECTED = "REJECTED"
 
@@ -140,6 +143,10 @@ class Donation(Base):
         Index('idx_verified_utr_status', 'extracted_utr', 'is_verified'),
     )
 
+    @property
+    def donor_name(self) -> Optional[str]:
+        return self.donor.full_name if self.donor else "Verified Donor"
+
     # Relationships
     donor = relationship("Donor", back_populates="donations")
     matched_statement = relationship("BankStatementEntry", back_populates="donations")
@@ -181,3 +188,7 @@ class TaxReceipt80G(Base):
     issued_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
     donation = relationship("Donation", back_populates="tax_receipt")
+
+
+# Alias for backward compatibility & standard references
+TaxReceipt = TaxReceipt80G

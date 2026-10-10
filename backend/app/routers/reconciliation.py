@@ -27,7 +27,9 @@ def get_reconciliation_stats(db: Session = Depends(get_db)):
     total_donations = db.query(Donation).count()
     matched_count = db.query(Donation).filter(Donation.status == DonationStatus.MATCHED).count()
     pending_count = db.query(Donation).filter(
-        (Donation.status == DonationStatus.PENDING_OCR) | (Donation.status == DonationStatus.EXTRACTED)
+        (Donation.status == DonationStatus.PENDING_OCR) | 
+        (Donation.status == DonationStatus.EXTRACTED) |
+        (Donation.status == DonationStatus.PENDING)
     ).count()
     flagged_count = db.query(Donation).filter(Donation.status == DonationStatus.FLAGGED_REVIEW).count()
     rejected_count = db.query(Donation).filter(Donation.status == DonationStatus.REJECTED).count()

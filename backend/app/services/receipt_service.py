@@ -103,7 +103,7 @@ class ReceiptService:
 
         # Certificate Badge
         receipt_badge = Table(
-            [[Paragraph("<b>DONATION TAX EXEMPTION CERTIFICATE (FORM 10BE / SECTION 80G)</b>", badge_style)]],
+            [[Paragraph("<b>OFFICIAL DONATION RECEIPT</b>", badge_style)]],
             colWidths=[520]
         )
         receipt_badge.setStyle(TableStyle([

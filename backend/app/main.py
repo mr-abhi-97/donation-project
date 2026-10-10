@@ -13,11 +13,6 @@ from backend.app.utils.sample_data import seed_sample_data
 async def lifespan(app: FastAPI):
     # Initialize database tables
     Base.metadata.create_all(bind=engine)
-    # Seed initial test data
-    try:
-        seed_sample_data()
-    except Exception as e:
-        print(f"Warning: sample data seed failed or already present: {e}")
     yield
 
 
@@ -38,7 +33,8 @@ app.add_middleware(
 )
 
 # Static file serving for uploaded screenshots and generated receipts
-app.mount("/api/uploads", StaticFiles(directory=str(settings.UPLOAD_DIR)), name="uploads")
+app.mount("/api/uploads", StaticFiles(directory=str(settings.UPLOAD_DIR)), name="api_uploads")
+app.mount("/uploads", StaticFiles(directory=str(settings.UPLOAD_DIR)), name="uploads")
 
 # Include Routers
 app.include_router(donors.router, prefix=settings.API_V1_STR)

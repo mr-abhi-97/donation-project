@@ -34,7 +34,7 @@ export interface TaxReceipt {
   issued_at: string;
 }
 
-export type DonationStatus = 'PENDING_OCR' | 'EXTRACTED' | 'MATCHED' | 'FLAGGED_REVIEW' | 'REJECTED';
+export type DonationStatus = 'PENDING' | 'PENDING_OCR' | 'EXTRACTED' | 'MATCHED' | 'SUCCESS' | 'FLAGGED_REVIEW' | 'REJECTED';
 
 export interface Donation {
   id: string;
@@ -104,7 +104,7 @@ export interface AuditReportData {
   }>;
 }
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api';
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api';
 
 export const api = {
   // Public donation submission
@@ -163,7 +163,7 @@ export const api = {
     return res.json() as Promise<Donation>;
   },
 
-  // Verify donation & issue 80G receipt
+  // Verify donation & issue official receipt
   async verifyDonation(id: string, auditData?: { verified_by_user?: string; admin_audit_notes?: string; bank_matched_mode?: string }) {
     const res = await fetch(`${API_BASE}/donations/${id}/verify`, {
       method: 'POST',
@@ -206,6 +206,18 @@ export const api = {
     return res.json() as Promise<Donation[]>;
   },
 
+  // Delete donation
+  async deleteDonation(id: string) {
+    const res = await fetch(`${API_BASE}/donations/${id}`, {
+      method: 'DELETE',
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to delete donation' }));
+      throw new Error(err.detail || 'Failed to delete donation');
+    }
+    return res.json();
+  },
+
   // Bank Statement upload
   async uploadBankStatement(file: File) {
     const formData = new FormData();
@@ -218,7 +230,7 @@ export const api = {
       const err = await res.json().catch(() => ({ detail: 'Failed to upload bank statement' }));
       throw new Error(err.detail || 'Failed to upload bank statement');
     }
-    return res.json() as Promise<BankStatementEntry[]>;
+    return res.json() as Promise<Donation[]>;
   },
 
   // Bank Statement entries
@@ -297,13 +309,13 @@ export const api = {
   getScreenshotUrl(urlPath: string) {
     if (!urlPath) return '';
     if (urlPath.startsWith('http')) return urlPath;
-    return `http://localhost:8000${urlPath}`;
+    return urlPath.startsWith('/') ? urlPath : `/${urlPath}`;
   },
 
   getReceiptPdfUrl(urlPath: string) {
     if (!urlPath) return '';
     if (urlPath.startsWith('http')) return urlPath;
-    return `http://localhost:8000${urlPath}`;
+    return urlPath.startsWith('/') ? urlPath : `/${urlPath}`;
   },
 
   getForm10BdExportUrl() {

@@ -143,7 +143,16 @@ class ReconciliationService:
                     except Exception:
                         bal_amt = None
 
+            # Extract UTR from narration or dedicated columns or row
             utr = cls.extract_utr_from_narration(narration_val)
+            if not utr:
+                # Check other cells in the row for 12-digit UTR
+                for cell in row.values:
+                    if pd.notna(cell):
+                        m = re.search(r'\b([0-9]{12})\b', str(cell))
+                        if m and not m.group(1).startswith("000000000000"):
+                            utr = m.group(1)
+                            break
 
             entries.append({
                 "transaction_date": date_val,

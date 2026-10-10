@@ -1,16 +1,16 @@
 import io
 import uuid
 from typing import List, Optional, Dict, Any
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, BackgroundTasks, status, Response
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from backend.app.config import settings
 from backend.app.database import get_db
-from backend.app.models import BankStatementEntry
-from backend.app.schemas import BankStatementEntryResponse
+from backend.app.models import BankStatementEntry, Donation, DonationStatus
+from backend.app.schemas import BankStatementEntryResponse, DonationResponse
 from backend.app.services.reconciliation_service import ReconciliationService
 from backend.app.services.storage_service import StorageService
 from backend.app.services.statement_verifier import StatementAuditor
@@ -21,7 +21,7 @@ router = APIRouter(prefix="/bank-statement", tags=["Bank Statement"])
 LATEST_STATEMENT_AUDITS = []
 
 
-@router.post("/upload", response_model=List[BankStatementEntryResponse], status_code=status.HTTP_201_CREATED)
+@router.post("/upload", response_model=List[DonationResponse], status_code=status.HTTP_201_CREATED)
 async def upload_bank_statement(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
@@ -108,10 +108,35 @@ async def upload_bank_statement(
     for r in created_records:
         db.refresh(r)
 
-    # Trigger auto-reconciliation engine
+    # Automatically compare each bank row's UTR with uploaded screenshot UTRs
+    for r in created_records:
+        if r.extracted_utr:
+            matching_donations = db.query(Donation).filter(
+                Donation.extracted_utr == r.extracted_utr
+            ).all()
+            for d in matching_donations:
+                d.status = DonationStatus.MATCHED
+                d.is_verified = True
+                d.matched_statement_id = r.id
+                d.bank_matched_mode = "AUTO_EXACT"
+                d.verified_at = datetime.now(timezone.utc)
+                d.verified_by_user = "AUTO_STATEMENT_MATCH"
+                d.flagged_reason = None
+                r.is_reconciled = True
+
+    db.commit()
+
+    # Trigger auto-reconciliation engine in background
     background_tasks.add_task(ReconciliationService.run_reconciliation, db)
 
-    return created_records
+    # Return updated list of all transactions with their matched status
+    all_donations = db.query(Donation).options(
+        joinedload(Donation.donor),
+        joinedload(Donation.matched_statement),
+        joinedload(Donation.tax_receipt)
+    ).order_by(Donation.created_at.desc()).all()
+
+    return all_donations
 
 
 def _parse_pdf_statement_fallback(file_bytes: bytes) -> List[Dict[str, Any]]:

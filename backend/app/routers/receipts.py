@@ -1,6 +1,8 @@
 import os
 import uuid
 from typing import List, Optional
+from pathlib import Path
+from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session, joinedload
@@ -12,6 +14,77 @@ from backend.app.schemas import TaxReceiptResponse
 from backend.app.services.receipt_service import ReceiptService
 
 router = APIRouter(prefix="/receipts", tags=["Tax Receipts"])
+
+
+@router.get("/{donation_id}/pdf")
+def get_donation_receipt_pdf(donation_id: uuid.UUID, db: Session = Depends(get_db)):
+    """
+    Downloads or streams generated 80G PDF receipt for a specific donation ID.
+    If receipt PDF doesn't exist yet, it is generated on-demand.
+    """
+    donation = db.query(Donation).options(
+        joinedload(Donation.donor),
+        joinedload(Donation.matched_statement),
+        joinedload(Donation.tax_receipt)
+    ).filter(Donation.id == donation_id).first()
+    if not donation:
+        raise HTTPException(status_code=404, detail="Donation record not found")
+
+    pdf_file_path = None
+    if donation.tax_receipt and donation.tax_receipt.pdf_path:
+        p = Path(donation.tax_receipt.pdf_path)
+        if p.exists():
+            pdf_file_path = p
+
+    if not pdf_file_path:
+        # Generate receipt on demand
+        if not donation.donor:
+            donor_name = "UPI Donor"
+            if donation.matched_statement and donation.matched_statement.narration:
+                parts = donation.matched_statement.narration.split('/')
+                if len(parts) >= 5 and parts[4].strip():
+                    donor_name = parts[4].strip()
+            fallback_donor = Donor(
+                id=uuid.uuid4(),
+                full_name=donor_name,
+                pan_number="AAAAA0000A",
+                phone="+919876543210",
+                email="donor@raiseindia.org"
+            )
+            db.add(fallback_donor)
+            db.flush()
+            donation.donor_id = fallback_donor.id
+            donation.donor = fallback_donor
+
+        receipt_count = db.query(TaxReceipt80G).count() + 1
+        receipt_no = ReceiptService.generate_receipt_number(receipt_count)
+        pdf_path = ReceiptService.generate_80g_pdf(donation, donation.donor, receipt_no)
+        pdf_url = f"/api/receipts/download/{receipt_no.replace('/', '_')}.pdf"
+
+        if not donation.tax_receipt:
+            tax_rec = TaxReceipt80G(
+                id=uuid.uuid4(),
+                donation_id=donation.id,
+                receipt_number=receipt_no,
+                financial_year=settings.CURRENT_FINANCIAL_YEAR,
+                eligible_amount=donation.extracted_amount or Decimal("0.0"),
+                pdf_path=str(pdf_path),
+                pdf_url=pdf_url
+            )
+            db.add(tax_rec)
+        else:
+            donation.tax_receipt.pdf_path = str(pdf_path)
+            donation.tax_receipt.pdf_url = pdf_url
+            donation.tax_receipt.receipt_number = receipt_no
+
+        db.commit()
+        pdf_file_path = pdf_path
+
+    return FileResponse(
+        path=str(pdf_file_path),
+        media_type="application/pdf",
+        filename=f"Receipt_{donation.id}.pdf"
+    )
 
 
 @router.get("/download/{filename}")

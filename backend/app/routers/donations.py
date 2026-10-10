@@ -102,9 +102,20 @@ async def public_submit_donation(
 
     # 7. OCR Extraction
     ocr_result = OCRService.process_screenshot(str(saved_path), file.filename)
-    extracted_utr = ocr_result.get("extracted_utr")
-    extracted_amt = ocr_result.get("extracted_amount")
-    if amount_paid and not extracted_amt:
+    raw_ocr_text = ocr_result.get("raw_text", "")
+
+    # Domain & Receipt Verification (Reject non-payment media like selfies/fashion/scenery)
+    domain_check = ScreenshotFraudDetector.verify_payment_receipt_domain(raw_ocr_text, file.filename)
+    is_valid_receipt = domain_check["is_valid"] and ocr_result.get("is_valid_receipt", False)
+    if not is_valid_receipt:
+        is_flagged_fraud = True
+        rejection_msg = domain_check.get("rejection_reason") or "NON_PAYMENT_IMAGE: Not a payment receipt (missing UPI payment anchors)."
+        if rejection_msg not in fraud_reasons:
+            fraud_reasons.append(rejection_msg)
+
+    extracted_utr = ocr_result.get("extracted_utr") if is_valid_receipt else None
+    extracted_amt = ocr_result.get("extracted_amount") if is_valid_receipt else None
+    if amount_paid and not extracted_amt and is_valid_receipt:
         extracted_amt = amount_paid
 
     extracted_date = None
@@ -120,9 +131,13 @@ async def public_submit_donation(
         if not utr_check["is_valid"]:
             is_flagged_fraud = True
             fraud_reasons.append(f"INVALID_UTR_SYNTAX: {utr_check['rejection_reason']}")
+            extracted_utr = None
 
     # Determine status
-    if is_flagged_fraud:
+    if not is_valid_receipt:
+        status_val = DonationStatus.REJECTED
+        flagged_reason = " | ".join(fraud_reasons)
+    elif is_flagged_fraud:
         status_val = DonationStatus.FLAGGED_REVIEW
         flagged_reason = " | ".join(fraud_reasons)
     else:
@@ -175,12 +190,28 @@ async def public_submit_donation(
 async def bulk_upload_screenshots(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
+    donor_name: Optional[str] = Form(None),
     db: Session = Depends(get_db)
 ):
     """
-    Admin Bulk Screenshot Upload endpoint with Anti-Fraud Inspection.
+    Admin Bulk Screenshot Upload endpoint with Anti-Fraud Inspection and automated Donor attribution.
+    - If donor_name is provided in the form, assign it to uploaded screenshots.
+    - If no name is provided, automatically extract Payer/Sender name from OCR and link the Donor.
     """
     created_donations = []
+    has_fixed_donor = bool(donor_name and donor_name.strip())
+    fixed_donor = None
+    if has_fixed_donor:
+        clean_donor_name = donor_name.strip()
+        fixed_donor = Donor(
+            id=uuid.uuid4(),
+            full_name=clean_donor_name,
+            pan_number="AAAAA0000A",
+            phone="+919876543210",
+            email=f"donor_{uuid.uuid4().hex[:6]}@raiseindia.org"
+        )
+        db.add(fixed_donor)
+        db.flush()
 
     for f in files:
         filename_lower = f.filename.lower()
@@ -211,22 +242,83 @@ async def bulk_upload_screenshots(
                         rel_url, img_path = StorageService.save_bytes(img_data, member_name, settings.SCREENSHOTS_DIR)
                         ocr_res = OCRService.process_screenshot(str(img_path), member_name)
 
-                        extracted_utr = ocr_res.get("extracted_utr")
+                        # Strict Payment Receipt Domain Verification
+                        domain_check = ScreenshotFraudDetector.verify_payment_receipt_domain(ocr_res.get("raw_text", ""), member_name)
+                        is_valid_receipt = domain_check["is_valid"] and ocr_res.get("is_valid_receipt", False) and ocr_res.get("status") != "REJECTED"
+                        if not is_valid_receipt:
+                            is_fraud = True
+                            rejection_msg = domain_check.get("rejection_reason") or "NON_PAYMENT_IMAGE: Missing UPI payment anchors (Not a payment receipt)."
+                            if rejection_msg not in fraud_reasons:
+                                fraud_reasons.append(rejection_msg)
+
+                        # Determine donor attribution
+                        if fixed_donor:
+                            assigned_donor = fixed_donor
+                        else:
+                            extracted_name = ocr_res.get("extracted_donor_name") if is_valid_receipt else "Unverified Uploader"
+                            if not extracted_name:
+                                extracted_name = "Verified Donor" if is_valid_receipt else "Unverified Uploader"
+                            assigned_donor = Donor(
+                                id=uuid.uuid4(),
+                                full_name=extracted_name,
+                                pan_number="AAAAA0000A",
+                                phone="+919876543210",
+                                email=f"donor_{uuid.uuid4().hex[:6]}@raiseindia.org"
+                            )
+                            db.add(assigned_donor)
+                            db.flush()
+
+                        extracted_utr = ocr_res.get("extracted_utr") if is_valid_receipt else None
                         if extracted_utr:
                             utr_syntax = ScreenshotFraudDetector.validate_utr_syntax(extracted_utr)
                             if not utr_syntax["is_valid"]:
                                 is_fraud = True
                                 fraud_reasons.append(f"INVALID_UTR_SYNTAX: {utr_syntax['rejection_reason']}")
+                                extracted_utr = None
+
+                        # Check if a bank statement entry already exists for this UTR
+                        matching_stmt = None
+                        if extracted_utr and is_valid_receipt:
+                            matching_stmt = db.query(BankStatementEntry).filter(
+                                BankStatementEntry.extracted_utr == extracted_utr
+                            ).first()
+
+                        if not is_valid_receipt or ocr_res.get("status") == "REJECTED":
+                            status_val = DonationStatus.REJECTED
+                            is_verified_val = False
+                            matched_stmt_id = None
+                            extracted_utr = None
+                            ocr_res["extracted_amount"] = None
+                            ocr_res["extracted_amount"] = None
+                        elif matching_stmt:
+                            status_val = DonationStatus.MATCHED
+                            is_verified_val = True
+                            matched_stmt_id = matching_stmt.id
+                            matching_stmt.is_reconciled = True
+                        else:
+                            status_val = DonationStatus.FLAGGED_REVIEW if is_fraud else DonationStatus.EXTRACTED
+                            is_verified_val = False
+                            matched_stmt_id = None
+
+                        extracted_date_val = None
+                        if ocr_res.get("extracted_date"):
+                            try:
+                                extracted_date_val = datetime.fromisoformat(ocr_res["extracted_date"])
+                            except Exception:
+                                extracted_date_val = datetime.now(timezone.utc)
 
                         donation = Donation(
                             id=uuid.uuid4(),
+                            donor_id=assigned_donor.id,
                             screenshot_url=rel_url,
                             extracted_utr=extracted_utr,
                             extracted_amount=Decimal(str(ocr_res["extracted_amount"])) if ocr_res.get("extracted_amount") else None,
+                            extracted_date=extracted_date_val,
                             raw_ocr_payload=ocr_res,
-                            ocr_confidence=ocr_res.get("confidence", 0.85),
-                            status=DonationStatus.FLAGGED_REVIEW if is_fraud else DonationStatus(ocr_res.get("status", "EXTRACTED")),
-                            is_verified=False,
+                            ocr_confidence=ocr_res.get("confidence", 0.85) if domain_check["is_valid"] else 0.0,
+                            status=status_val,
+                            matched_statement_id=matched_stmt_id,
+                            is_verified=is_verified_val,
                             image_sha256=sha256_hash,
                             tamper_score=ela_res.get("tamper_score", 0.0),
                             ela_heatmap_url=ela_res.get("ela_base64", ""),
@@ -253,22 +345,82 @@ async def bulk_upload_screenshots(
             rel_url, img_path = StorageService.save_bytes(img_data, f.filename, settings.SCREENSHOTS_DIR)
             ocr_res = OCRService.process_screenshot(str(img_path), f.filename)
 
-            extracted_utr = ocr_res.get("extracted_utr")
+            # Strict Payment Receipt Domain Verification
+            domain_check = ScreenshotFraudDetector.verify_payment_receipt_domain(ocr_res.get("raw_text", ""), f.filename)
+            is_valid_receipt = domain_check["is_valid"] and ocr_res.get("is_valid_receipt", False) and ocr_res.get("status") != "REJECTED"
+            if not is_valid_receipt:
+                is_fraud = True
+                rejection_msg = domain_check.get("rejection_reason") or "NON_PAYMENT_IMAGE: Missing UPI payment anchors (Not a payment receipt)."
+                if rejection_msg not in fraud_reasons:
+                    fraud_reasons.append(rejection_msg)
+
+            # Determine donor attribution
+            if fixed_donor:
+                assigned_donor = fixed_donor
+            else:
+                extracted_name = ocr_res.get("extracted_donor_name") if is_valid_receipt else "Unverified Uploader"
+                if not extracted_name:
+                    extracted_name = "Verified Donor" if is_valid_receipt else "Unverified Uploader"
+                assigned_donor = Donor(
+                    id=uuid.uuid4(),
+                    full_name=extracted_name,
+                    pan_number="AAAAA0000A",
+                    phone="+919876543210",
+                    email=f"donor_{uuid.uuid4().hex[:6]}@raiseindia.org"
+                )
+                db.add(assigned_donor)
+                db.flush()
+
+            extracted_utr = ocr_res.get("extracted_utr") if is_valid_receipt else None
             if extracted_utr:
                 utr_syntax = ScreenshotFraudDetector.validate_utr_syntax(extracted_utr)
                 if not utr_syntax["is_valid"]:
                     is_fraud = True
                     fraud_reasons.append(f"INVALID_UTR_SYNTAX: {utr_syntax['rejection_reason']}")
+                    extracted_utr = None
+
+            # Check if a bank statement entry already exists for this UTR
+            matching_stmt = None
+            if extracted_utr and is_valid_receipt:
+                matching_stmt = db.query(BankStatementEntry).filter(
+                    BankStatementEntry.extracted_utr == extracted_utr
+                ).first()
+
+            if not is_valid_receipt or ocr_res.get("status") == "REJECTED":
+                status_val = DonationStatus.REJECTED
+                is_verified_val = False
+                matched_stmt_id = None
+                extracted_utr = None
+                ocr_res["extracted_amount"] = None
+            elif matching_stmt:
+                status_val = DonationStatus.MATCHED
+                is_verified_val = True
+                matched_stmt_id = matching_stmt.id
+                matching_stmt.is_reconciled = True
+            else:
+                status_val = DonationStatus.FLAGGED_REVIEW if is_fraud else DonationStatus.EXTRACTED
+                is_verified_val = False
+                matched_stmt_id = None
+
+            extracted_date_val = None
+            if ocr_res.get("extracted_date"):
+                try:
+                    extracted_date_val = datetime.fromisoformat(ocr_res["extracted_date"])
+                except Exception:
+                    extracted_date_val = datetime.now(timezone.utc)
 
             donation = Donation(
                 id=uuid.uuid4(),
+                donor_id=assigned_donor.id,
                 screenshot_url=rel_url,
                 extracted_utr=extracted_utr,
                 extracted_amount=Decimal(str(ocr_res["extracted_amount"])) if ocr_res.get("extracted_amount") else None,
+                extracted_date=extracted_date_val,
                 raw_ocr_payload=ocr_res,
-                ocr_confidence=ocr_res.get("confidence", 0.85),
-                status=DonationStatus.FLAGGED_REVIEW if is_fraud else DonationStatus(ocr_res.get("status", "EXTRACTED")),
-                is_verified=False,
+                ocr_confidence=ocr_res.get("confidence", 0.85) if domain_check["is_valid"] else 0.0,
+                status=status_val,
+                matched_statement_id=matched_stmt_id,
+                is_verified=is_verified_val,
                 image_sha256=sha256_hash,
                 tamper_score=ela_res.get("tamper_score", 0.0),
                 ela_heatmap_url=ela_res.get("ela_base64", ""),
@@ -280,11 +432,15 @@ async def bulk_upload_screenshots(
             created_donations.append(donation)
 
     db.commit()
-    for d in created_donations:
-        db.refresh(d)
+    ids = [d.id for d in created_donations]
+    result_donations = db.query(Donation).options(
+        joinedload(Donation.donor),
+        joinedload(Donation.matched_statement),
+        joinedload(Donation.tax_receipt)
+    ).filter(Donation.id.in_(ids)).order_by(Donation.created_at.desc()).all()
 
     background_tasks.add_task(ReconciliationService.run_reconciliation, db)
-    return created_donations
+    return result_donations
 
 
 @router.get("/", response_model=List[DonationResponse])
@@ -293,7 +449,7 @@ def list_donations(
     is_verified: Optional[bool] = Query(None),
     is_flagged_fraud: Optional[bool] = Query(None),
     search: Optional[str] = Query(None, description="Search by UTR or Donor Name / PAN"),
-    limit: int = 50,
+    limit: int = 200,
     offset: int = 0,
     db: Session = Depends(get_db)
 ):
@@ -373,6 +529,19 @@ def update_donation(
                 donation.is_flagged_fraud = False
                 donation.flagged_reason = None
 
+        # Check if matching bank statement exists for this newly updated UTR
+        matching_stmt = db.query(BankStatementEntry).filter(
+            BankStatementEntry.extracted_utr == clean_utr
+        ).first()
+        if matching_stmt:
+            donation.status = DonationStatus.MATCHED
+            donation.is_verified = True
+            donation.matched_statement_id = matching_stmt.id
+            donation.bank_matched_mode = "MANUAL_EDIT_MATCH"
+            donation.verified_at = datetime.now(timezone.utc)
+            donation.verified_by_user = "INLINE_EDIT"
+            matching_stmt.is_reconciled = True
+
     if payload.extracted_amount is not None:
         donation.extracted_amount = payload.extracted_amount
     if payload.extracted_date is not None:
@@ -396,6 +565,16 @@ def update_donation(
 
     db.refresh(donation)
     return donation
+
+
+@router.patch("/{donation_id}/edit", response_model=DonationResponse)
+def update_donation_edit(
+    donation_id: uuid.UUID,
+    payload: DonationUpdate,
+    db: Session = Depends(get_db)
+):
+    """Alias route for inline UTR edit from frontend cockpit."""
+    return update_donation(donation_id=donation_id, payload=payload, db=db)
 
 
 @router.post("/{donation_id}/verify", response_model=DonationResponse)
@@ -457,7 +636,25 @@ def verify_donation(
         donation.matched_statement.is_reconciled = True
 
     # 3. Generate 80G Tax Receipt
-    if donation.donor and not donation.tax_receipt:
+    if not donation.tax_receipt:
+        if not donation.donor:
+            donor_name = "UPI Donor"
+            if donation.matched_statement and donation.matched_statement.narration:
+                parts = donation.matched_statement.narration.split('/')
+                if len(parts) >= 5 and parts[4].strip():
+                    donor_name = parts[4].strip()
+            fallback_donor = Donor(
+                id=uuid.uuid4(),
+                full_name=donor_name,
+                pan_number="AAAAA0000A",
+                phone="+919876543210",
+                email="donor@raiseindia.org"
+            )
+            db.add(fallback_donor)
+            db.flush()
+            donation.donor_id = fallback_donor.id
+            donation.donor = fallback_donor
+
         receipt_count = db.query(TaxReceipt80G).count() + 1
         receipt_no = ReceiptService.generate_receipt_number(receipt_count)
         
@@ -515,3 +712,31 @@ def reject_donation(
     db.commit()
     db.refresh(donation)
     return donation
+
+
+@router.delete("/{donation_id}", status_code=status.HTTP_200_OK)
+def delete_donation(donation_id: str, db: Session = Depends(get_db)):
+    try:
+        parsed_id = uuid.UUID(donation_id)
+    except ValueError:
+        parsed_id = donation_id
+
+    donation = db.query(Donation).filter((Donation.id == donation_id) | (Donation.id == parsed_id)).first()
+    if not donation:
+        raise HTTPException(status_code=404, detail="Donation record not found")
+
+    # Unlink matched bank statement if any
+    if donation.matched_statement_id:
+        stmt = db.query(BankStatementEntry).filter(BankStatementEntry.id == donation.matched_statement_id).first()
+        if stmt:
+            stmt.is_reconciled = False
+
+    # Remove receipt records if any
+    db.query(TaxReceipt80G).filter(
+        (TaxReceipt80G.donation_id == donation.id) | (TaxReceipt80G.donation_id == donation_id)
+    ).delete(synchronize_session=False)
+
+    db.delete(donation)
+    db.commit()
+    return {"status": "success", "message": f"Donation {donation_id} deleted successfully"}
+

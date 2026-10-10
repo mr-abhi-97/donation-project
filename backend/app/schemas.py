@@ -114,6 +114,7 @@ class DonationResponse(BaseModel):
     id: UUID
     donor_id: Optional[UUID] = None
     donor: Optional[DonorResponse] = None
+    donor_name: Optional[str] = None
     screenshot_url: str
     extracted_utr: Optional[str] = None
     extracted_amount: Optional[Decimal] = None

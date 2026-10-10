@@ -153,3 +153,81 @@ class ScreenshotFraudDetector:
             "is_valid": True,
             "rejection_reason": None
         }
+
+    UPI_PAYMENT_ANCHORS = [
+        "upi", "utr", "transaction id", "trans id", "txn id", "ref no",
+        "reference no", "paid to", "payment to", "transfer to", "paid successfully",
+        "payment successful", "completed", "debited from", "credited to",
+        "google pay", "phonepe", "paytm", "bhim", "banking name"
+    ]
+
+    @classmethod
+    def verify_payment_receipt_domain(cls, raw_text: str, filename: str = None) -> dict:
+        """
+        Strict UPI payment receipt domain verification:
+        1. Checks whether extracted OCR text contains genuine UPI payment receipt anchors.
+        2. Detects and rejects non-payment random images (fashion, selfies, scenery, general photos).
+        3. Returns validation status, matched anchors, and specific rejection reason if invalid.
+        """
+        text_lower = (raw_text or "").lower()
+
+        # Immediate rejection of non-financial placeholders
+        if "[non_financial_media]" in text_lower or "non-financial" in text_lower or "zero transaction" in text_lower:
+            return {
+                "is_valid": False,
+                "rejection_reason": "NON_PAYMENT_IMAGE: Uploaded file does not contain recognized UPI payment receipt anchors (UPI, UTR, Txn ID, Paid to, Google Pay, PhonePe, Paytm, BHIM). Media identified as random non-financial content.",
+                "matched_anchors": [],
+                "confidence_score": 0.0
+            }
+
+        # Check for receipt keywords in filename if provided
+        filename_lower = (filename or "").lower()
+        known_receipt_filename_tags = [
+            "utr", "receipt", "payment", "gpay", "phonepe", "paytm", "bhim",
+            "upi", "transaction", "txn", "paid"
+        ]
+        has_filename_receipt_hint = any(tag in filename_lower for tag in known_receipt_filename_tags)
+
+        # Explicit non-payment markers in filename
+        non_payment_tags = [
+            "selfie", "fashion", "scenery", "nature", "landscape", "wallpaper",
+            "dress", "shirt", "model", "avatar", "profile", "cat", "dog", "car"
+        ]
+        has_non_payment_tag = any(tag in filename_lower for tag in non_payment_tags)
+
+        # Word boundary search for anchors
+        matched_anchors = []
+        for anchor in cls.UPI_PAYMENT_ANCHORS:
+            if re.search(r'\b' + re.escape(anchor) + r'\b', text_lower):
+                matched_anchors.append(anchor)
+
+        if has_non_payment_tag and not matched_anchors:
+            return {
+                "is_valid": False,
+                "rejection_reason": "NON_PAYMENT_IMAGE: Detected non-payment media (selfie/fashion/scenery/photo). Missing all UPI payment anchors.",
+                "matched_anchors": [],
+                "confidence_score": 0.0
+            }
+
+        # Must have at least 1 genuine payment anchor to qualify as a payment receipt
+        if len(matched_anchors) >= 2 or (len(matched_anchors) >= 1 and has_filename_receipt_hint):
+            return {
+                "is_valid": True,
+                "rejection_reason": None,
+                "matched_anchors": matched_anchors,
+                "confidence_score": min(1.0, 0.4 + (len(matched_anchors) * 0.15))
+            }
+        elif len(matched_anchors) == 1 and not has_non_payment_tag:
+            return {
+                "is_valid": True,
+                "rejection_reason": None,
+                "matched_anchors": matched_anchors,
+                "confidence_score": 0.65
+            }
+        else:
+            return {
+                "is_valid": False,
+                "rejection_reason": "NON_PAYMENT_IMAGE: Missing required UPI payment anchors (UPI, UTR, Txn ID, Paid to, Google Pay, PhonePe, Paytm, BHIM). Image identified as non-financial media.",
+                "matched_anchors": [],
+                "confidence_score": 0.0
+            }
