@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from "react";
 import confetti from "canvas-confetti";
+import { api } from "@/lib/api";
 import {
   UploadCloud,
   FileSpreadsheet,
@@ -677,9 +678,21 @@ export default function SingleScreenReconciliation() {
                           {item.screenshot_url ? (
                             <button
                               onClick={() => setPreviewItem(item)}
-                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-xs font-semibold text-indigo-700 transition"
+                              className="group/thumb flex items-center gap-2 p-1 rounded-lg bg-indigo-50/60 hover:bg-indigo-100/80 border border-indigo-200/80 transition"
+                              title="Click to view proof forensics preview"
                             >
-                              <Eye className="w-3.5 h-3.5"/> Preview
+                              <img
+                                src={api.getScreenshotUrl(item.screenshot_url)}
+                                alt="Proof thumbnail"
+                                className="w-9 h-9 object-cover rounded-md border border-slate-200 shadow-2xs group-hover/thumb:scale-105 transition-transform"
+                                onError={(e) => {
+                                  (e.target as HTMLImageElement).src =
+                                    "https://placehold.co/100x100/f8fafc/64748b?text=Receipt";
+                                }}
+                              />
+                              <span className="inline-flex items-center gap-1 text-xs font-semibold text-indigo-700 pr-1.5">
+                                <Eye className="w-3.5 h-3.5"/> Preview
+                              </span>
                             </button>
                           ) : (
                             <span className="text-xs text-slate-400 italic">None</span>
@@ -971,13 +984,7 @@ export default function SingleScreenReconciliation() {
             {/* Image Preview Viewport */}
             <div className="bg-slate-100 rounded-xl p-2 flex items-center justify-center max-h-[60vh] overflow-hidden border border-slate-200">
               <img
-                src={
-                  previewItem.screenshot_url?.startsWith("http")
-                    ? previewItem.screenshot_url
-                    : previewItem.screenshot_url?.startsWith("/")
-                    ? previewItem.screenshot_url
-                    : `/${previewItem.screenshot_url}`
-                }
+                src={api.getScreenshotUrl(previewItem.screenshot_url)}
                 alt="Payment Proof"
                 className="w-full h-auto max-h-[55vh] object-contain rounded-lg shadow-2xs"
                 onError={(e) => {
@@ -994,13 +1001,7 @@ export default function SingleScreenReconciliation() {
               </div>
               <div className="flex items-center gap-2">
                 <a
-                  href={
-                    previewItem.screenshot_url?.startsWith("http")
-                      ? previewItem.screenshot_url
-                      : previewItem.screenshot_url?.startsWith("/")
-                      ? previewItem.screenshot_url
-                      : `/${previewItem.screenshot_url}`
-                  }
+                  href={api.getScreenshotUrl(previewItem.screenshot_url)}
                   target="_blank"
                   rel="noreferrer"
                   className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-xs font-semibold text-slate-700 rounded-lg transition inline-flex items-center gap-1"

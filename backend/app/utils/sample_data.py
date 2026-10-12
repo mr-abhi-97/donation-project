@@ -7,9 +7,10 @@ from PIL import Image, ImageDraw, ImageFont
 
 from backend.app.config import settings
 from backend.app.database import SessionLocal, Base, engine
-from backend.app.models import Donor, Donation, BankStatementEntry, DonationStatus
+from backend.app.models import Donor, Donation, BankStatementEntry, DonationStatus, TaxReceipt80G
 from backend.app.services.ocr_service import OCRService
 from backend.app.services.reconciliation_service import ReconciliationService
+from backend.app.services.receipt_service import ReceiptService
 from backend.app.services.anti_fraud_service import ScreenshotFraudDetector
 from backend.app.utils.validators import normalize_indian_phone
 
@@ -70,7 +71,7 @@ def create_mock_upi_screenshot(filename: str, app_name: str, amount: float, utr:
 
     file_path = settings.SCREENSHOTS_DIR / filename
     img.save(file_path, "PNG")
-    return f"/api/uploads/screenshots/{filename}"
+    return f"/uploads/screenshots/{filename}"
 
 
 def seed_sample_data():
@@ -81,8 +82,8 @@ def seed_sample_data():
     db = SessionLocal()
     try:
         # Check if already seeded
-        if db.query(Donor).count() > 0:
-            print("Database already contains records. Skipping seed.")
+        if db.query(Donation).count() > 0:
+            print("Database already contains donation records. Skipping seed.")
             return
 
         print("Seeding demo data for Raise India...")
@@ -139,6 +140,14 @@ def seed_sample_data():
         url4 = create_mock_upi_screenshot("bhim_receipt_fuzzy_482910482910.png", "BHIM", 21000.0, "482910482910", "07 Oct 2024, 02:10 PM")
         url5 = create_mock_upi_screenshot("unmatched_receipt_998877665544.png", "GPay", 7500.0, "998877665544", "06 Oct 2024, 09:00 AM")
         url6 = create_mock_upi_screenshot("tampered_receipt_000000000000.png", "PhonePe", 50000.0, "000000000000", "05 Oct 2024, 12:00 PM")
+
+        # 2b. Non-payment image
+        img7 = Image.new("RGB", (480, 840), color=(135, 206, 235))
+        d7 = ImageDraw.Draw(img7)
+        d7.text((50, 400), "Scenic Mountain Landscape Nature Wallpaper", fill=(255, 255, 255))
+        p7 = settings.SCREENSHOTS_DIR / "wallpaper_scenery.png"
+        img7.save(p7, "PNG")
+        url7 = "/uploads/screenshots/wallpaper_scenery.png"
 
         # 3. Create bank statement entries with continuous running balances
         batch_id = "INIT_DEMO"
@@ -281,7 +290,7 @@ def seed_sample_data():
             ocr_confidence=0.88,
             status=DonationStatus.FLAGGED_REVIEW,
             flagged_reason="Fuzzy UTR match (distance 1): Extracted 482910482910 vs Bank 482910482911. Amount ₹21,000 matches exactly.",
-            matched_statement_id=stmt4.id,
+            matched_statement_id=None,
             is_verified=False,
             image_sha256=h4,
             tamper_score=t4,
@@ -323,13 +332,54 @@ def seed_sample_data():
                 "INVALID_UTR_SYNTAX: Dummy or test UTR sequence detected",
                 "HIGH_ELA_SCORE: Error Level Analysis detected non-uniform JPEG recompression (85.4%)"
             ]
+        # 7. Non-Payment Image Demo (Rejected as non-financial media)
+        with open(p7, "rb") as f7:
+            b7 = f7.read()
+        h7 = ScreenshotFraudDetector.calculate_file_hash(b7)
+        don7 = Donation(
+            id=uuid.uuid4(),
+            donor_id=donor5.id,
+            screenshot_url=url7,
+            extracted_utr=None,
+            extracted_amount=None,
+            extracted_date=datetime(2024, 10, 4, 15, 30, tzinfo=timezone.utc),
+            ocr_confidence=0.0,
+            status=DonationStatus.REJECTED,
+            flagged_reason="NON_PAYMENT_IMAGE: Missing required UPI/Bank payment anchors.",
+            is_verified=False,
+            image_sha256=h7,
+            tamper_score=0.0,
+            ela_heatmap_url="",
+            is_flagged_fraud=True,
+            fraud_reasons=[
+                "NON_PAYMENT_IMAGE: Missing required UPI/Bank payment anchors."
+            ]
         )
 
-        db.add_all([don1, don2, don3, don4, don5, don6])
+        db.add_all([don1, don2, don3, don4, don5, don6, don7])
         db.commit()
 
         # Run auto-reconciliation to match don1, don2, don3
         ReconciliationService.run_reconciliation(db)
-        print("Demo data seeded and anti-fraud reconciliation complete!")
+
+        # Generate sample 80G tax receipts for verified donations
+        verified_donations = db.query(Donation).filter(Donation.is_verified == True).all()
+        for idx, vd in enumerate(verified_donations, 1):
+            receipt_no = ReceiptService.generate_receipt_number(idx)
+            pdf_path = ReceiptService.generate_80g_pdf(vd, vd.donor, receipt_no)
+            pdf_url = f"/api/receipts/download/{receipt_no.replace('/', '_')}.pdf"
+            tax_rec = TaxReceipt80G(
+                id=uuid.uuid4(),
+                donation_id=vd.id,
+                receipt_number=receipt_no,
+                financial_year=settings.CURRENT_FINANCIAL_YEAR,
+                eligible_amount=vd.extracted_amount or Decimal("0.0"),
+                pdf_path=str(pdf_path),
+                pdf_url=pdf_url
+            )
+            db.add(tax_rec)
+        db.commit()
+
+        print("Demo data seeded, anti-fraud reconciliation complete, and 80G receipts issued!")
     finally:
         db.close()

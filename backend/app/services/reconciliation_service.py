@@ -3,12 +3,16 @@ import re
 import uuid
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
+import logging
 from typing import List, Dict, Any, Optional, Tuple
 import pandas as pd
 from sqlalchemy.orm import Session
 
+from backend.app.database import SessionLocal
 from backend.app.models import Donation, BankStatementEntry, DonationStatus
 from backend.app.schemas import FuzzyCandidateResponse, BankStatementEntryResponse, to_pydantic
+
+logger = logging.getLogger(__name__)
 
 
 def levenshtein_distance(s1: str, s2: str) -> int:
@@ -46,7 +50,8 @@ class ReconciliationService:
             
         patterns = [
             r'(?:UPI|CMS|NEFT|IMPS|RTGS)[/-]([0-9]{12})\b',
-            r'(?:UTR|REF|TXN)[:\s/-]*([0-9]{12})\b',
+            r'(?:AUTO[\s\-_]*ID|AOTID|APP\s*ORDER|ORDER)[/-]([A-Za-z0-9]{8,24})\b',
+            r'(?:UTR|REF|TXN|AUTO[\s\-_]*ID|AOTID|ORDER)[:\s/-]*([A-Za-z0-9]{8,24})\b',
             r'\b([0-9]{12})\b'
         ]
 
@@ -165,7 +170,7 @@ class ReconciliationService:
         return entries
 
     @classmethod
-    def run_reconciliation(cls, db: Session) -> Dict[str, Any]:
+    def run_reconciliation(cls, db: Optional[Session] = None) -> Dict[str, Any]:
         """
         Runs automated reconciliation between donations and bank statements.
         
@@ -183,6 +188,11 @@ class ReconciliationService:
         4. Unmatched:
            Remains FLAGGED_REVIEW / EXTRACTED.
         """
+        session_to_close = None
+        if db is None:
+            db = SessionLocal()
+            session_to_close = db
+
         stats = {
             "exact_matches": 0,
             "fuzzy_matches": 0,
@@ -190,115 +200,123 @@ class ReconciliationService:
             "total_processed": 0
         }
 
-        # Step 1: Detect duplicate UTRs in donations
-        all_donations = db.query(Donation).all()
-        utr_counts: Dict[str, List[Donation]] = {}
-        for d in all_donations:
-            if d.extracted_utr:
-                utr_counts.setdefault(d.extracted_utr, []).append(d)
+        try:
+            # Step 1: Detect duplicate UTRs in donations
+            all_donations = db.query(Donation).all()
+            utr_counts: Dict[str, List[Donation]] = {}
+            for d in all_donations:
+                if d.extracted_utr:
+                    utr_counts.setdefault(d.extracted_utr, []).append(d)
 
-        for utr, group in utr_counts.items():
-            if len(group) > 1:
-                for d in group:
-                    if d.status != DonationStatus.REJECTED:
-                        d.status = DonationStatus.FLAGGED_REVIEW
-                        d.flagged_reason = f"Duplicate UTR detected: {utr} submitted across multiple donations."
-                        stats["duplicates_flagged"] += 1
+            for utr, group in utr_counts.items():
+                if len(group) > 1:
+                    for d in group:
+                        if d.status != DonationStatus.REJECTED:
+                            d.status = DonationStatus.FLAGGED_REVIEW
+                            d.flagged_reason = f"Duplicate UTR detected: {utr} submitted across multiple donations."
+                            stats["duplicates_flagged"] += 1
 
-        # Fetch pending or extracted or flagged donations that are not yet verified
-        unverified_donations = db.query(Donation).filter(
-            Donation.is_verified == False,
-            Donation.status != DonationStatus.REJECTED
-        ).all()
+            # Fetch pending or extracted or flagged donations that are not yet verified
+            unverified_donations = db.query(Donation).filter(
+                Donation.is_verified == False,
+                Donation.status != DonationStatus.REJECTED
+            ).all()
 
-        unreconciled_statements = db.query(BankStatementEntry).filter(
-            BankStatementEntry.is_reconciled == False
-        ).all()
+            unreconciled_statements = db.query(BankStatementEntry).filter(
+                BankStatementEntry.is_reconciled == False
+            ).all()
 
-        # Build index of statements by UTR
-        statement_by_utr: Dict[str, BankStatementEntry] = {}
-        for st in unreconciled_statements:
-            if st.extracted_utr:
-                statement_by_utr[st.extracted_utr] = st
-
-        for donation in unverified_donations:
-            stats["total_processed"] += 1
-            matched = False
-
-            # --- Check Exact Match ---
-            if donation.extracted_utr and donation.extracted_utr in statement_by_utr:
-                st = statement_by_utr[donation.extracted_utr]
-                # Check amount match (tolerance 0.00)
-                if donation.extracted_amount is not None and abs(Decimal(str(donation.extracted_amount)) - Decimal(str(st.credit_amount))) < Decimal("0.01"):
-                    donation.matched_statement_id = st.id
-                    
-                    if donation.is_flagged_fraud:
-                        # Fraud-flagged donations require human CA audit before verification
-                        donation.status = DonationStatus.FLAGGED_REVIEW
-                        donation.flagged_reason = f"Exact bank credit matched (₹{st.credit_amount}), but submission is FLAGGED FOR FRAUD review: {', '.join(donation.fraud_reasons or [])}"
-                        donation.bank_matched_mode = "AUTO_FUZZY"
-                    else:
-                        donation.status = DonationStatus.MATCHED
-                        donation.is_verified = True
-                        donation.flagged_reason = None
-                        donation.bank_matched_mode = "AUTO_EXACT"
-                        donation.verified_at = datetime.now(timezone.utc)
-                        donation.verified_by_user = "AUTO_RECON_ENGINE"
-                        donation.admin_audit_notes = "Auto-reconciled: Exact match on 12-digit UTR and credit amount"
-                        st.is_reconciled = True
-                        stats["exact_matches"] += 1
-                        # Remove from pool
-                        del statement_by_utr[donation.extracted_utr]
-                    matched = True
-
-            if matched:
-                continue
-
-            # --- Check Fuzzy Match ---
-            best_candidate = None
-            best_score = 0.0
-            best_reason = ""
-
+            # Build index of statements by UTR
+            statement_by_utr: Dict[str, BankStatementEntry] = {}
             for st in unreconciled_statements:
-                if st.is_reconciled:
+                if st.extracted_utr:
+                    statement_by_utr[st.extracted_utr] = st
+
+            for donation in unverified_donations:
+                stats["total_processed"] += 1
+                matched = False
+
+                # --- Check Exact Match ---
+                if donation.extracted_utr and donation.extracted_utr in statement_by_utr:
+                    st = statement_by_utr[donation.extracted_utr]
+                    # Check amount match (tolerance 0.00)
+                    if donation.extracted_amount is not None and abs(Decimal(str(donation.extracted_amount)) - Decimal(str(st.credit_amount))) < Decimal("0.01"):
+                        donation.matched_statement_id = st.id
+                        
+                        if donation.is_flagged_fraud:
+                            # Fraud-flagged donations require human CA audit before verification
+                            donation.status = DonationStatus.FLAGGED_REVIEW
+                            donation.flagged_reason = f"Exact bank credit matched (₹{st.credit_amount}), but submission is FLAGGED FOR FRAUD review: {', '.join(donation.fraud_reasons or [])}"
+                            donation.bank_matched_mode = "AUTO_FUZZY"
+                        else:
+                            donation.status = DonationStatus.MATCHED
+                            donation.is_verified = True
+                            donation.flagged_reason = None
+                            donation.bank_matched_mode = "AUTO_EXACT"
+                            donation.verified_at = datetime.now(timezone.utc)
+                            donation.verified_by_user = "AUTO_RECON_ENGINE"
+                            donation.admin_audit_notes = "Auto-reconciled: Exact match on 12-digit UTR and credit amount"
+                            st.is_reconciled = True
+                            stats["exact_matches"] += 1
+                            # Remove from pool
+                            del statement_by_utr[donation.extracted_utr]
+                        matched = True
+
+                if matched:
                     continue
 
-                amount_matches = False
-                if donation.extracted_amount is not None:
-                    amount_matches = (abs(Decimal(str(donation.extracted_amount)) - Decimal(str(st.credit_amount))) < Decimal("0.01"))
+                # --- Check Fuzzy Match ---
+                best_candidate = None
+                best_score = 0.0
+                best_reason = ""
 
-                # Check UTR Levenshtein
-                dist = 999
-                if donation.extracted_utr and st.extracted_utr:
-                    dist = levenshtein_distance(donation.extracted_utr, st.extracted_utr)
+                for st in unreconciled_statements:
+                    if st.is_reconciled:
+                        continue
 
-                # Check date difference
-                days_diff = 999
-                if donation.extracted_date and st.transaction_date:
-                    donation_dt = donation.extracted_date.date() if isinstance(donation.extracted_date, datetime) else donation.extracted_date
-                    days_diff = abs((donation_dt - st.transaction_date).days)
+                    amount_matches = False
+                    if donation.extracted_amount is not None:
+                        amount_matches = (abs(Decimal(str(donation.extracted_amount)) - Decimal(str(st.credit_amount))) < Decimal("0.01"))
 
-                if amount_matches and dist <= 2:
-                    score = 0.95 - (dist * 0.1)
-                    if score > best_score:
-                        best_score = score
-                        best_candidate = st
-                        best_reason = f"Fuzzy UTR match (distance {dist}): Extracted {donation.extracted_utr} vs Bank {st.extracted_utr}. Amount ₹{st.credit_amount} matches exactly."
-                elif amount_matches and days_diff <= 2:
-                    score = 0.80 - (days_diff * 0.05)
-                    if score > best_score:
-                        best_score = score
-                        best_candidate = st
-                        best_reason = f"Amount matches ₹{st.credit_amount} within {days_diff} day(s), but UTR differs or missing in OCR. Needs manual verification."
+                    # Check UTR Levenshtein
+                    dist = 999
+                    if donation.extracted_utr and st.extracted_utr:
+                        dist = levenshtein_distance(donation.extracted_utr, st.extracted_utr)
 
-            if best_candidate and best_score >= 0.70:
-                donation.status = DonationStatus.FLAGGED_REVIEW
-                donation.matched_statement_id = best_candidate.id
-                donation.flagged_reason = best_reason
-                stats["fuzzy_matches"] += 1
+                    # Check date difference
+                    days_diff = 999
+                    if donation.extracted_date and st.transaction_date:
+                        donation_dt = donation.extracted_date.date() if isinstance(donation.extracted_date, datetime) else donation.extracted_date
+                        days_diff = abs((donation_dt - st.transaction_date).days)
 
-        db.commit()
-        return stats
+                    if amount_matches and dist <= 2:
+                        score = 0.95 - (dist * 0.1)
+                        if score > best_score:
+                            best_score = score
+                            best_candidate = st
+                            best_reason = f"Fuzzy UTR match (distance {dist}): Extracted {donation.extracted_utr} vs Bank {st.extracted_utr}. Amount ₹{st.credit_amount} matches exactly."
+                    elif amount_matches and days_diff <= 2:
+                        score = 0.80 - (days_diff * 0.05)
+                        if score > best_score:
+                            best_score = score
+                            best_candidate = st
+                            best_reason = f"Amount matches ₹{st.credit_amount} within {days_diff} day(s), but UTR differs or missing in OCR. Needs manual verification."
+
+                if best_candidate and best_score >= 0.70:
+                    donation.status = DonationStatus.FLAGGED_REVIEW
+                    donation.matched_statement_id = best_candidate.id
+                    donation.flagged_reason = best_reason
+                    stats["fuzzy_matches"] += 1
+
+            db.commit()
+            return stats
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error during reconciliation run: {e}")
+            raise
+        finally:
+            if session_to_close is not None:
+                session_to_close.close()
 
     @classmethod
     def get_fuzzy_candidates(cls, db: Session, donation: Donation) -> List[Dict[str, Any]]:

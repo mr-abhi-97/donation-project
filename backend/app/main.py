@@ -33,8 +33,15 @@ app.add_middleware(
 )
 
 # Static file serving for uploaded screenshots and generated receipts
-app.mount("/api/uploads", StaticFiles(directory=str(settings.UPLOAD_DIR)), name="api_uploads")
-app.mount("/uploads", StaticFiles(directory=str(settings.UPLOAD_DIR)), name="uploads")
+import os
+
+UPLOAD_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "uploads"))
+os.makedirs(os.path.join(UPLOAD_DIR, "screenshots"), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "receipts"), exist_ok=True)
+os.makedirs(os.path.join(UPLOAD_DIR, "statements"), exist_ok=True)
+
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+app.mount("/api/uploads", StaticFiles(directory=UPLOAD_DIR), name="api_uploads")
 
 # Include Routers
 app.include_router(donors.router, prefix=settings.API_V1_STR)

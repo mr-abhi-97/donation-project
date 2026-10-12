@@ -127,7 +127,7 @@ async def upload_bank_statement(
     db.commit()
 
     # Trigger auto-reconciliation engine in background
-    background_tasks.add_task(ReconciliationService.run_reconciliation, db)
+    background_tasks.add_task(ReconciliationService.run_reconciliation)
 
     # Return updated list of all transactions with their matched status
     all_donations = db.query(Donation).options(

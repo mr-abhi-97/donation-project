@@ -85,15 +85,15 @@ class ScreenshotFraudDetector:
             }
 
     @staticmethod
-    def validate_utr_syntax(utr: str) -> dict:
+    def validate_utr_syntax(utr: str, allow_custom_id: bool = False) -> dict:
         r"""
-        Validates UPI UTR (12-digit Unique Transaction Reference) syntax:
-        1. Must match exact 12-digit numeric regex: ^\d{12}$
+        Validates UPI UTR / Auto-ID / AOTID / App Order ID transaction reference syntax:
+        1. Must match 8-24 characters.
         2. Disallows dummy or test sequences (e.g., 000000000000, 111111111111, 123456789012)
-        3. Disallows low entropy strings (<= 2 unique digits)
-        4. Validates Julian date/year prefix (digits 1-4):
-           - Digit 1: Year indicator (e.g. 0-9)
-           - Digits 2-4: Julian day of year (001 - 366)
+        3. Disallows low entropy strings (<= 2 unique characters)
+        4. Validates Julian date/year prefix (digits 1-4) for standard 12-digit UPI UTRs.
+           Auto-ID, AOTID, and App Order IDs are accepted without Julian constraint when allow_custom_id=True
+           or when containing alphanumeric order identifiers.
         """
         if not utr or not isinstance(utr, str):
             return {
@@ -103,14 +103,7 @@ class ScreenshotFraudDetector:
 
         cleaned = utr.strip()
 
-        # 1. Check exact 12 digits regex
-        if not re.match(r"^\d{12}$", cleaned):
-            return {
-                "is_valid": False,
-                "rejection_reason": f"Invalid UTR format: '{cleaned}' must be exactly 12 numeric digits"
-            }
-
-        # 2. Check dummy sequences
+        # 1. Check dummy sequences
         known_dummies = {
             "000000000000",
             "111111111111",
@@ -125,29 +118,34 @@ class ScreenshotFraudDetector:
                 "rejection_reason": "Dummy or test UTR sequence detected"
             }
 
-        # 3. Check entropy (number of distinct digits)
+        # 2. Check entropy (number of distinct characters)
         if len(set(cleaned)) <= 2:
             return {
                 "is_valid": False,
-                "rejection_reason": "Insufficient digit entropy in UTR (too few unique digits)"
+                "rejection_reason": "Insufficient character entropy in transaction reference"
             }
 
-        # 4. Check Julian date prefix reasonableness (digits 2-4)
-        # In Indian banking standard for UPI:
-        # Digit 1: Last digit of Year (e.g. 4 for 2024, 5 for 2025, 6 for 2026)
-        # Digits 2-4: Julian Day of the year (001 - 366)
-        try:
-            julian_day = int(cleaned[1:4])
-            if julian_day < 1 or julian_day > 366:
-                return {
-                    "is_valid": False,
-                    "rejection_reason": f"Invalid Julian day prefix ({cleaned[1:4]}): Days must be between 001 and 366"
-                }
-        except ValueError:
+        # 3. Check general format
+        if not re.match(r"^[A-Za-z0-9\-_]{8,24}$", cleaned):
             return {
                 "is_valid": False,
-                "rejection_reason": "Invalid Julian day prefix encoding"
+                "rejection_reason": f"Invalid reference format: '{cleaned}' must be 8-24 alphanumeric characters or 12 numeric digits"
             }
+
+        # 4. Standard 12-digit numeric UPI UTR validation
+        if re.match(r"^\d{12}$", cleaned) and not allow_custom_id:
+            try:
+                julian_day = int(cleaned[1:4])
+                if julian_day < 1 or julian_day > 366:
+                    return {
+                        "is_valid": False,
+                        "rejection_reason": f"Invalid Julian day prefix ({cleaned[1:4]}): Days must be between 001 and 366"
+                    }
+            except ValueError:
+                return {
+                    "is_valid": False,
+                    "rejection_reason": "Invalid Julian day prefix encoding"
+                }
 
         return {
             "is_valid": True,
@@ -155,10 +153,12 @@ class ScreenshotFraudDetector:
         }
 
     UPI_PAYMENT_ANCHORS = [
-        "upi", "utr", "transaction id", "trans id", "txn id", "ref no",
-        "reference no", "paid to", "payment to", "transfer to", "paid successfully",
+        "upi", "utr", "transaction id", "trans id", "txn id", "ref no", "ref id", "ref", "rrn",
+        "reference no", "reference", "paid to", "payment to", "transfer to", "paid successfully",
         "payment successful", "completed", "debited from", "credited to",
-        "google pay", "phonepe", "paytm", "bhim", "banking name"
+        "auto-id", "auto id", "autoid", "auto_id", "aotid", "aot id", "aot-id",
+        "app order id", "app order", "order id", "order no", "order num",
+        "google pay", "phonepe", "paytm", "bhim", "banking name", "bank", "amount", "rupees", "inr"
     ]
 
     @classmethod

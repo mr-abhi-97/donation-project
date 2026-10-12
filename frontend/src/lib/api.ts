@@ -306,16 +306,36 @@ export const api = {
   },
 
   // Asset URLs
-  getScreenshotUrl(urlPath: string) {
+  getScreenshotUrl(urlPath?: string) {
     if (!urlPath) return '';
-    if (urlPath.startsWith('http')) return urlPath;
-    return urlPath.startsWith('/') ? urlPath : `/${urlPath}`;
+    if (urlPath.startsWith('blob:') || urlPath.startsWith('data:')) return urlPath;
+
+    // Strip hardcoded localhost / loopback domains so LAN devices use relative Next.js proxying
+    let clean = urlPath.replace(/^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0):\d+/, '');
+    if (clean.startsWith('http://') || clean.startsWith('https://')) return clean;
+
+    clean = clean.replace(/^\/+/, '');
+
+    // Normalize api/uploads/... to uploads/...
+    if (clean.startsWith('api/uploads/')) {
+      clean = clean.replace(/^api\/uploads\//, 'uploads/');
+    }
+
+    if (clean.startsWith('screenshots/') || clean.startsWith('statements/') || clean.startsWith('receipts/')) {
+      clean = `uploads/${clean}`;
+    } else if (!clean.startsWith('uploads/')) {
+      clean = `uploads/screenshots/${clean}`;
+    }
+
+    return `/${clean}`;
   },
 
-  getReceiptPdfUrl(urlPath: string) {
+  getReceiptPdfUrl(urlPath?: string) {
     if (!urlPath) return '';
-    if (urlPath.startsWith('http')) return urlPath;
-    return urlPath.startsWith('/') ? urlPath : `/${urlPath}`;
+    if (urlPath.startsWith('http://') || urlPath.startsWith('https://')) return urlPath;
+    let clean = urlPath.replace(/^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0):\d+/, '');
+    if (!clean.startsWith('/')) clean = '/' + clean;
+    return clean;
   },
 
   getForm10BdExportUrl() {
