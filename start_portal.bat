@@ -1,0 +1,13 @@
+@echo off
+title Raise India Portal Launcher
+cls
+echo [1/3] Freeing Port 8000 and 3000...
+taskkill /F /IM python.exe >nul 2>&1
+echo [2/3] Starting FastAPI Backend on Port 8000...
+start "Backend" cmd /k "cd /d E:\new try && .\backend\venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000"
+timeout /t 3 /nobreak >nul
+echo [3/3] Starting Next.js Frontend on Port 3000...
+start "Frontend" cmd /k "cd /d E:[new try\frontend && npm run dev"
+timeout /t 4 /nobreak >nul
+echo Opening Browser...
+start http://localhost:3000
