@@ -102,6 +102,9 @@ class DonationUpdate(BaseModel):
     flagged_reason: Optional[str] = None
     matched_statement_id: Optional[UUID] = None
     admin_audit_notes: Optional[str] = None
+    original_transaction_id: Optional[UUID] = None
+    original_transaction_hash: Optional[str] = None
+    duplicate_metadata: Optional[Dict[str, Any]] = None
 
 
 class VerifyDonationRequest(BaseModel):
@@ -134,6 +137,12 @@ class DonationResponse(BaseModel):
     is_flagged_fraud: bool = False
     fraud_reasons: Optional[List[str]] = None
 
+    # Duplicate UTR Tracking & Metadata
+    original_transaction_id: Optional[UUID] = None
+    original_transaction_hash: Optional[str] = None
+    duplicate_metadata: Optional[Dict[str, Any]] = None
+    is_duplicate_utr: bool = False
+
     # CA Audit Trail
     verified_by_user: Optional[str] = None
     verified_at: Optional[datetime] = None
@@ -159,6 +168,10 @@ class PublicDonationSubmissionResponse(BaseModel):
     is_flagged_fraud: bool = False
     tamper_score: float = 0.0
     fraud_reasons: Optional[List[str]] = None
+    original_transaction_id: Optional[UUID] = None
+    original_transaction_hash: Optional[str] = None
+    duplicate_metadata: Optional[Dict[str, Any]] = None
+    is_duplicate_utr: bool = False
     message: str
 
     class Config:
@@ -178,6 +191,7 @@ class ReconciliationStatsResponse(BaseModel):
     total_statement_entries: int
     unreconciled_statement_count: int
     fraud_flagged_count: int = 0
+    duplicate_flagged_count: int = 0
 
 
 class FuzzyCandidateResponse(BaseModel):

@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from backend.app.config import settings
-from backend.app.database import engine, Base
+from backend.app.database import engine, Base, ensure_db_schema
 from backend.app.routers import donors, donations, bank_statement, reconciliation, receipts
 from backend.app.utils.sample_data import seed_sample_data
 
@@ -13,6 +13,7 @@ from backend.app.utils.sample_data import seed_sample_data
 async def lifespan(app: FastAPI):
     # Initialize database tables
     Base.metadata.create_all(bind=engine)
+    ensure_db_schema(engine)
     yield
 
 

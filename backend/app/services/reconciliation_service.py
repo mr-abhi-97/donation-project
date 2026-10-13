@@ -202,24 +202,50 @@ class ReconciliationService:
 
         try:
             # Step 1: Detect duplicate UTRs in donations
-            all_donations = db.query(Donation).all()
-            utr_counts: Dict[str, List[Donation]] = {}
+            all_donations = db.query(Donation).order_by(Donation.created_at.asc()).all()
+            utr_first_seen: Dict[str, Donation] = {}
             for d in all_donations:
-                if d.extracted_utr:
-                    utr_counts.setdefault(d.extracted_utr, []).append(d)
+                if not d.extracted_utr:
+                    continue
+                clean_utr = d.extracted_utr.strip()
+                if clean_utr in utr_first_seen:
+                    original = utr_first_seen[clean_utr]
+                    # Flag this subsequent record as DUPLICATE_FLAGGED and block automatic credit
+                    d.status = DonationStatus.DUPLICATE_FLAGGED
+                    d.is_flagged_fraud = True
+                    d.is_verified = False
+                    if d.matched_statement_id:
+                        old_st = db.query(BankStatementEntry).filter(BankStatementEntry.id == d.matched_statement_id).first()
+                        if old_st:
+                            old_st.is_reconciled = False
+                        d.matched_statement_id = None
+                    d.original_transaction_id = original.id
+                    d.original_transaction_hash = original.image_sha256
+                    d.duplicate_metadata = {
+                        "original_transaction_id": str(original.id),
+                        "original_transaction_hash": original.image_sha256,
+                        "original_created_at": original.created_at.isoformat() if original.created_at else None,
+                        "original_donor_name": original.donor_name,
+                        "original_amount": float(original.extracted_amount) if original.extracted_amount else None,
+                        "duplicate_utr": clean_utr,
+                        "flagged_at": datetime.now(timezone.utc).isoformat(),
+                        "reason": "DUPLICATE_UTR_DETECTED"
+                    }
+                    reasons = list(d.fraud_reasons or [])
+                    dup_msg = f"DUPLICATE_UTR: 12-digit UTR '{clean_utr}' already exists in transaction {original.id}."
+                    if dup_msg not in reasons:
+                        reasons.append(dup_msg)
+                    d.fraud_reasons = reasons
+                    d.flagged_reason = f"Duplicate UTR detected: '{clean_utr}' already registered in transaction {original.id}."
+                    stats["duplicates_flagged"] += 1
+                else:
+                    utr_first_seen[clean_utr] = d
 
-            for utr, group in utr_counts.items():
-                if len(group) > 1:
-                    for d in group:
-                        if d.status != DonationStatus.REJECTED:
-                            d.status = DonationStatus.FLAGGED_REVIEW
-                            d.flagged_reason = f"Duplicate UTR detected: {utr} submitted across multiple donations."
-                            stats["duplicates_flagged"] += 1
-
-            # Fetch pending or extracted or flagged donations that are not yet verified
+            # Fetch pending or extracted or flagged donations (STRICTLY EXCLUDE DUPLICATE_FLAGGED to prevent double crediting)
             unverified_donations = db.query(Donation).filter(
                 Donation.is_verified == False,
-                Donation.status != DonationStatus.REJECTED
+                Donation.status != DonationStatus.REJECTED,
+                Donation.status != DonationStatus.DUPLICATE_FLAGGED
             ).all()
 
             unreconciled_statements = db.query(BankStatementEntry).filter(

@@ -34,7 +34,7 @@ export interface TaxReceipt {
   issued_at: string;
 }
 
-export type DonationStatus = 'PENDING' | 'PENDING_OCR' | 'EXTRACTED' | 'MATCHED' | 'SUCCESS' | 'FLAGGED_REVIEW' | 'REJECTED';
+export type DonationStatus = 'PENDING' | 'PENDING_OCR' | 'EXTRACTED' | 'MATCHED' | 'SUCCESS' | 'FLAGGED_REVIEW' | 'DUPLICATE_FLAGGED' | 'REJECTED';
 
 export interface Donation {
   id: string;
@@ -58,6 +58,11 @@ export interface Donation {
   ela_heatmap_url?: string;
   is_flagged_fraud?: boolean;
   fraud_reasons?: string[];
+  // Duplicate UTR Reference Metadata
+  original_transaction_id?: string;
+  original_transaction_hash?: string;
+  duplicate_metadata?: Record<string, any>;
+  is_duplicate_utr?: boolean;
   verified_by_user?: string;
   verified_at?: string;
   bank_matched_mode?: string;
@@ -71,6 +76,7 @@ export interface ReconciliationStats {
   matched_count: number;
   pending_count: number;
   flagged_count: number;
+  duplicate_flagged_count?: number;
   fraud_flagged_count?: number;
   rejected_count: number;
   total_amount_collected: number;

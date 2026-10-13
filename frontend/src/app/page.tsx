@@ -55,6 +55,11 @@ interface DonationItem {
   tamper_score?: number;
   is_flagged_fraud?: boolean;
   fraud_reasons?: string[];
+  flagged_reason?: string;
+  original_transaction_id?: string;
+  original_transaction_hash?: string;
+  duplicate_metadata?: Record<string, any>;
+  is_duplicate_utr?: boolean;
   matched_statement?: {
     narration: string;
     transaction_date: string;
@@ -661,10 +666,15 @@ export default function SingleScreenReconciliation() {
                   </tr>
                 ) : (
                   filtered.map((item, index) => {
-                    const isMatched = item.is_verified || item.status === "MATCHED";
-                    const isCopied = copiedId === item.id;
                     const isNonPayment = item.status === "REJECTED" || (item.fraud_reasons && item.fraud_reasons.some(r => r.includes("NON_PAYMENT_IMAGE") || r.toLowerCase().includes("non-payment")));
-                    const isDuplicate = item.is_duplicate_hash || (item.fraud_reasons && item.fraud_reasons.some(r => r.toLowerCase().includes("duplicate")));
+                    const isDuplicateUtr = item.status === "DUPLICATE_FLAGGED" ||
+                      Boolean(item.original_transaction_id) ||
+                      Boolean(item.is_duplicate_utr) ||
+                      (item.fraud_reasons && item.fraud_reasons.some(r => r.toLowerCase().includes("duplicate_utr") || r.toLowerCase().includes("duplicate utr"))) ||
+                      (item.flagged_reason && item.flagged_reason.toLowerCase().includes("duplicate utr"));
+                    const isMatched = !isDuplicateUtr && (item.is_verified || item.status === "MATCHED");
+                    const isCopied = copiedId === item.id;
+                    const isDuplicateHash = item.is_duplicate_hash || (item.fraud_reasons && item.fraud_reasons.some(r => r.toLowerCase().includes("duplicate_file_hash") || r.toLowerCase().includes("identical screenshot")));
                     const isTampered = item.is_flagged_fraud || (item.tamper_score !== undefined && item.tamper_score > 25);
                     const scoreText = item.tamper_score !== undefined ? `${item.tamper_score.toFixed(1)}%` : "0.0%";
                     const donorDisplayName = isNonPayment ? "Unverified Uploader" : (item.donor?.full_name || item.donor_name || "Verified Donor");
@@ -707,7 +717,7 @@ export default function SingleScreenReconciliation() {
                           </div>
                         </td>
 
-                        {/* Proof Authenticity (🟢 Genuine vs 🟡 Edited vs 🔴 Duplicate vs 🔴 Non-Payment) */}
+                        {/* Proof Authenticity (🟢 Genuine vs ⚠️ Duplicate UTR vs 🔴 Duplicate Proof vs 🔴 Non-Payment) */}
                         <td className="py-3.5 px-4">
                           {isNonPayment ? (
                             <div className="flex flex-col gap-0.5" title={(item.fraud_reasons || []).join(" | ") || "Non-payment random image detected."}>
@@ -717,7 +727,17 @@ export default function SingleScreenReconciliation() {
                               </span>
                               <span className="text-[10px] text-rose-600 font-mono pl-1">Random media • No UPI data</span>
                             </div>
-                          ) : isDuplicate ? (
+                          ) : isDuplicateUtr ? (
+                            <div className="flex flex-col gap-0.5" title={item.flagged_reason || (item.fraud_reasons && item.fraud_reasons.join(" | ")) || "Duplicate UTR detected: 12-digit UTR already registered in previous transaction."}>
+                              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-extrabold bg-amber-100 text-amber-900 border border-amber-300 shadow-xs animate-pulse">
+                                <AlertTriangle className="w-3.5 h-3.5 text-amber-600 flex-shrink-0" />
+                                <span>⚠️ DUPLICATE UTR DETECTED</span>
+                              </span>
+                              <span className="text-[10px] text-amber-800 font-mono pl-1 font-semibold">
+                                {item.original_transaction_id ? `Ref: Txn #${String(item.original_transaction_id).slice(0, 8)}` : "Possible Fraud • Double Claim"}
+                              </span>
+                            </div>
+                          ) : isDuplicateHash ? (
                             <div className="flex flex-col gap-0.5" title="Identical screenshot file hash already submitted in system.">
                               <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold bg-rose-50 text-rose-700 border border-rose-200">
                                 <ShieldAlert className="w-3.5 h-3.5 text-rose-600 flex-shrink-0" />
@@ -827,9 +847,13 @@ export default function SingleScreenReconciliation() {
                           )}
                         </td>
 
-                        {/* Bank Match Status (🟢 SUCCESS vs 🟡 PENDING vs 🔴 REJECTED) */}
+                        {/* Bank Match Status (🟢 SUCCESS vs 🚫 BLOCKED (DUPLICATE) vs 🟡 PENDING vs 🔴 REJECTED) */}
                         <td className="py-3.5 px-4">
-                          {isNonPayment || item.status === "REJECTED" ? (
+                          {isDuplicateUtr ? (
+                            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-rose-100 text-rose-800 border border-rose-300 shadow-2xs">
+                              <ShieldAlert className="w-3.5 h-3.5 text-rose-600 flex-shrink-0"/> BLOCKED (DUPLICATE)
+                            </span>
+                          ) : isNonPayment || item.status === "REJECTED" ? (
                             <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-rose-50 text-rose-700 border border-rose-200">
                               <X className="w-3.5 h-3.5 text-rose-600"/> REJECTED
                             </span>
@@ -952,12 +976,25 @@ export default function SingleScreenReconciliation() {
 
             {/* Forensics Inspection Strip */}
             <div className={`p-3 rounded-xl border text-xs flex items-center justify-between ${
-              previewItem.is_flagged_fraud || (previewItem.tamper_score !== undefined && previewItem.tamper_score > 25)
+              previewItem.status === "DUPLICATE_FLAGGED" || (previewItem.fraud_reasons && previewItem.fraud_reasons.some(r => r.toLowerCase().includes("duplicate utr") || r.includes("DUPLICATE_UTR"))) || previewItem.original_transaction_id
+                ? "bg-amber-100 border-amber-300 text-amber-900"
+                : previewItem.is_flagged_fraud || (previewItem.tamper_score !== undefined && previewItem.tamper_score > 25)
                 ? "bg-rose-50 border-rose-200 text-rose-800"
                 : "bg-emerald-50 border-emerald-200 text-emerald-800"
             }`}>
               <div className="flex items-center gap-2.5">
-                {previewItem.is_flagged_fraud || (previewItem.tamper_score !== undefined && previewItem.tamper_score > 25) ? (
+                {previewItem.status === "DUPLICATE_FLAGGED" || (previewItem.fraud_reasons && previewItem.fraud_reasons.some(r => r.toLowerCase().includes("duplicate utr") || r.includes("DUPLICATE_UTR"))) || previewItem.original_transaction_id ? (
+                  <>
+                    <AlertTriangle className="w-4 h-4 text-amber-600 flex-shrink-0" />
+                    <div>
+                      <span className="font-bold">⚠️ DUPLICATE UTR DETECTED (POSSIBLE FRAUD)</span>
+                      <p className="text-[11px] text-amber-800">
+                        {(previewItem.fraud_reasons && previewItem.fraud_reasons.find(r => r.toLowerCase().includes("duplicate utr") || r.includes("DUPLICATE_UTR"))) || previewItem.flagged_reason || "12-digit UTR already registered in previous transaction."}
+                        {previewItem.original_transaction_id && ` • Original Ref ID: ${previewItem.original_transaction_id}`}
+                      </p>
+                    </div>
+                  </>
+                ) : previewItem.is_flagged_fraud || (previewItem.tamper_score !== undefined && previewItem.tamper_score > 25) ? (
                   <>
                     <ShieldAlert className="w-4 h-4 text-rose-600 flex-shrink-0" />
                     <div>

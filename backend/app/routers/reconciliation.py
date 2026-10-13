@@ -31,9 +31,16 @@ def get_reconciliation_stats(db: Session = Depends(get_db)):
         (Donation.status == DonationStatus.EXTRACTED) |
         (Donation.status == DonationStatus.PENDING)
     ).count()
-    flagged_count = db.query(Donation).filter(Donation.status == DonationStatus.FLAGGED_REVIEW).count()
+    duplicate_flagged_count = db.query(Donation).filter(Donation.status == DonationStatus.DUPLICATE_FLAGGED).count()
+    flagged_count = db.query(Donation).filter(
+        (Donation.status == DonationStatus.FLAGGED_REVIEW) |
+        (Donation.status == DonationStatus.DUPLICATE_FLAGGED)
+    ).count()
     rejected_count = db.query(Donation).filter(Donation.status == DonationStatus.REJECTED).count()
-    fraud_flagged_count = db.query(Donation).filter(Donation.is_flagged_fraud == True).count()
+    fraud_flagged_count = db.query(Donation).filter(
+        (Donation.is_flagged_fraud == True) |
+        (Donation.status == DonationStatus.DUPLICATE_FLAGGED)
+    ).count()
 
     total_amount_sum = db.query(func.sum(Donation.extracted_amount)).scalar() or Decimal("0.0")
     
@@ -59,7 +66,8 @@ def get_reconciliation_stats(db: Session = Depends(get_db)):
         match_rate_percentage=round(match_rate, 1),
         total_statement_entries=total_statement_entries,
         unreconciled_statement_count=unreconciled_statement_count,
-        fraud_flagged_count=fraud_flagged_count
+        fraud_flagged_count=fraud_flagged_count,
+        duplicate_flagged_count=duplicate_flagged_count
     )
 
 

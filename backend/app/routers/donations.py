@@ -128,7 +128,12 @@ async def public_submit_donation(
         except Exception:
             extracted_date = datetime.now(timezone.utc)
 
-    # 8. UTR Syntax Validation
+    # 8. UTR Syntax Validation & Duplicate Detection
+    original_donation = None
+    original_tx_id = None
+    original_tx_hash = None
+    duplicate_meta = None
+
     if extracted_utr:
         is_custom = ocr_result.get("is_custom_id", False)
         utr_check = ScreenshotFraudDetector.validate_utr_syntax(extracted_utr, allow_custom_id=is_custom)
@@ -136,10 +141,35 @@ async def public_submit_donation(
             is_flagged_fraud = True
             fraud_reasons.append(f"INVALID_UTR_SYNTAX: {utr_check['rejection_reason']}")
 
+        # Query SQLite database to verify if extracted UTR already exists
+        if is_valid_receipt:
+            clean_utr = extracted_utr.strip()
+            original_donation = ScreenshotFraudDetector.check_duplicate_utr(db, clean_utr)
+            if original_donation:
+                is_flagged_fraud = True
+                original_tx_id = original_donation.id
+                original_tx_hash = original_donation.image_sha256
+                duplicate_meta = {
+                    "original_transaction_id": str(original_tx_id),
+                    "original_transaction_hash": original_tx_hash,
+                    "original_created_at": original_donation.created_at.isoformat() if original_donation.created_at else None,
+                    "original_donor_name": original_donation.donor_name,
+                    "original_amount": float(original_donation.extracted_amount) if original_donation.extracted_amount else None,
+                    "duplicate_utr": clean_utr,
+                    "flagged_at": datetime.now(timezone.utc).isoformat(),
+                    "reason": "DUPLICATE_UTR_DETECTED"
+                }
+                fraud_reasons.append(
+                    f"DUPLICATE_UTR: 12-digit UTR '{clean_utr}' already exists in transaction {original_tx_id} (Hash: {original_tx_hash or 'N/A'}). Potential recycling fraud / duplicate submission."
+                )
+
     # Determine status
     if not is_valid_receipt:
         status_val = DonationStatus.REJECTED
         flagged_reason = " | ".join(fraud_reasons)
+    elif original_donation:
+        status_val = DonationStatus.DUPLICATE_FLAGGED
+        flagged_reason = f"Duplicate UTR detected: '{extracted_utr}' already registered in transaction {original_donation.id}."
     elif is_flagged_fraud:
         status_val = DonationStatus.FLAGGED_REVIEW
         flagged_reason = " | ".join(fraud_reasons)
@@ -165,7 +195,11 @@ async def public_submit_donation(
         tamper_score=tamper_score,
         ela_heatmap_url=ela_base64,
         is_flagged_fraud=is_flagged_fraud,
-        fraud_reasons=list(fraud_reasons or [])
+        fraud_reasons=list(fraud_reasons or []),
+        # Duplicate UTR reference metadata
+        original_transaction_id=original_tx_id,
+        original_transaction_hash=original_tx_hash,
+        duplicate_metadata=duplicate_meta
     )
     db.add(donation)
     try:
@@ -179,8 +213,8 @@ async def public_submit_donation(
             detail=f"Database operational error saving donation: {str(db_err)}"
         )
 
-    # 10. Run auto reconciliation in background if not fraudulent
-    if not is_flagged_fraud:
+    # 10. Run auto reconciliation in background ONLY if not fraudulent and not duplicate
+    if not is_flagged_fraud and status_val != DonationStatus.DUPLICATE_FLAGGED:
         background_tasks.add_task(ReconciliationService.run_reconciliation)
 
     return PublicDonationSubmissionResponse(
@@ -258,9 +292,34 @@ def _process_single_image(img_data: bytes, filename: str, fixed_donor: Optional[
                 is_fraud = True
                 fraud_reasons.append(f"INVALID_UTR_SYNTAX: {utr_syntax.get('rejection_reason', 'Invalid UTR format')}")
 
-        # Check if a bank statement entry already exists for this UTR
-        matching_stmt = None
+        # Check if extracted UTR already exists in database (Duplicate UTR Anti-Fraud Guard)
+        existing_dup_entry = None
+        original_tx_id = None
+        original_tx_hash = None
+        dup_meta = None
         if extracted_utr and is_valid_receipt:
+            existing_dup_entry = ScreenshotFraudDetector.check_duplicate_utr(db, extracted_utr)
+            if existing_dup_entry:
+                is_fraud = True
+                original_tx_id = existing_dup_entry.id
+                original_tx_hash = existing_dup_entry.image_sha256
+                dup_meta = {
+                    "original_transaction_id": str(original_tx_id),
+                    "original_transaction_hash": original_tx_hash,
+                    "original_created_at": existing_dup_entry.created_at.isoformat() if existing_dup_entry.created_at else None,
+                    "original_donor_name": existing_dup_entry.donor_name,
+                    "original_amount": float(existing_dup_entry.extracted_amount) if existing_dup_entry.extracted_amount else None,
+                    "duplicate_utr": extracted_utr,
+                    "flagged_at": datetime.now(timezone.utc).isoformat(),
+                    "reason": "DUPLICATE_UTR_DETECTED"
+                }
+                fraud_reasons.append(
+                    f"DUPLICATE_UTR: 12-digit UTR '{extracted_utr}' already exists in transaction {original_tx_id} (Hash: {original_tx_hash or 'N/A'}). Potential recycling fraud / duplicate submission."
+                )
+
+        # Check if a bank statement entry already exists for this UTR ONLY IF NOT DUPLICATE
+        matching_stmt = None
+        if extracted_utr and is_valid_receipt and not existing_dup_entry:
             matching_stmt = db.query(BankStatementEntry).filter(
                 BankStatementEntry.extracted_utr == extracted_utr
             ).first()
@@ -271,6 +330,16 @@ def _process_single_image(img_data: bytes, filename: str, fixed_donor: Optional[
             is_verified_val = False
             matched_stmt_id = None
             extracted_utr = None
+        elif existing_dup_entry:
+            # Block bank reconciliation for duplicate record to avoid double crediting
+            status_val = DonationStatus.DUPLICATE_FLAGGED
+            is_verified_val = False
+            matched_stmt_id = None
+            if ocr_res.get("extracted_amount"):
+                try:
+                    extracted_amount_val = Decimal(str(ocr_res["extracted_amount"]))
+                except Exception:
+                    extracted_amount_val = None
         elif matching_stmt:
             status_val = DonationStatus.MATCHED
             is_verified_val = True
@@ -315,7 +384,11 @@ def _process_single_image(img_data: bytes, filename: str, fixed_donor: Optional[
             ela_heatmap_url=ela_res.get("ela_base64", ""),
             is_flagged_fraud=bool(is_fraud),
             fraud_reasons=list(fraud_reasons or []),
-            flagged_reason=" | ".join(fraud_reasons) if fraud_reasons else None
+            flagged_reason=" | ".join(fraud_reasons) if fraud_reasons else None,
+            # Duplicate UTR reference metadata
+            original_transaction_id=original_tx_id,
+            original_transaction_hash=original_tx_hash,
+            duplicate_metadata=dup_meta
         )
         db.add(donation)
         db.flush()
@@ -492,35 +565,73 @@ def update_donation(
     if payload.extracted_utr is not None:
         clean_utr = payload.extracted_utr.strip()
         donation.extracted_utr = clean_utr
-        # Validate syntax
-        is_custom = not clean_utr.isnumeric() or len(clean_utr) != 12
-        utr_check = ScreenshotFraudDetector.validate_utr_syntax(clean_utr, allow_custom_id=is_custom)
-        if not utr_check["is_valid"]:
-            donation.is_flagged_fraud = True
-            reasons = list(donation.fraud_reasons or [])
-            reasons.append(f"INVALID_UTR_SYNTAX: {utr_check['rejection_reason']}")
-            donation.fraud_reasons = reasons
-            donation.flagged_reason = utr_check["rejection_reason"]
-        else:
-            # If previously flagged only for UTR, clear
-            reasons = [r for r in (donation.fraud_reasons or []) if not r.startswith("INVALID_UTR_SYNTAX")]
-            donation.fraud_reasons = reasons
-            if not reasons:
-                donation.is_flagged_fraud = False
-                donation.flagged_reason = None
 
-        # Check if matching bank statement exists for this newly updated UTR
-        matching_stmt = db.query(BankStatementEntry).filter(
-            BankStatementEntry.extracted_utr == clean_utr
-        ).first()
-        if matching_stmt:
-            donation.status = DonationStatus.MATCHED
-            donation.is_verified = True
-            donation.matched_statement_id = matching_stmt.id
-            donation.bank_matched_mode = "MANUAL_EDIT_MATCH"
-            donation.verified_at = datetime.now(timezone.utc)
-            donation.verified_by_user = "INLINE_EDIT"
-            matching_stmt.is_reconciled = True
+        # Check duplicate UTR against database
+        dup_entry = ScreenshotFraudDetector.check_duplicate_utr(db, clean_utr, current_donation_id=donation.id)
+        if dup_entry:
+            donation.is_flagged_fraud = True
+            donation.status = DonationStatus.DUPLICATE_FLAGGED
+            donation.is_verified = False
+            # Unlink any existing matched statement to prevent double crediting
+            if donation.matched_statement_id:
+                old_stmt = db.query(BankStatementEntry).filter(BankStatementEntry.id == donation.matched_statement_id).first()
+                if old_stmt:
+                    old_stmt.is_reconciled = False
+                donation.matched_statement_id = None
+            donation.original_transaction_id = dup_entry.id
+            donation.original_transaction_hash = dup_entry.image_sha256
+            donation.duplicate_metadata = {
+                "original_transaction_id": str(dup_entry.id),
+                "original_transaction_hash": dup_entry.image_sha256,
+                "original_created_at": dup_entry.created_at.isoformat() if dup_entry.created_at else None,
+                "original_donor_name": dup_entry.donor_name,
+                "original_amount": float(dup_entry.extracted_amount) if dup_entry.extracted_amount else None,
+                "duplicate_utr": clean_utr,
+                "flagged_at": datetime.now(timezone.utc).isoformat(),
+                "reason": "DUPLICATE_UTR_DETECTED"
+            }
+            reasons = list(donation.fraud_reasons or [])
+            reasons = [r for r in reasons if not r.startswith("DUPLICATE_UTR")]
+            reasons.append(f"DUPLICATE_UTR: 12-digit UTR '{clean_utr}' already exists in transaction {dup_entry.id}.")
+            donation.fraud_reasons = reasons
+            donation.flagged_reason = f"Duplicate UTR detected: '{clean_utr}' already registered in transaction {dup_entry.id}."
+        else:
+            # Clear previous duplicate flags if fixed
+            donation.original_transaction_id = None
+            donation.original_transaction_hash = None
+            donation.duplicate_metadata = None
+            reasons = [r for r in (donation.fraud_reasons or []) if not r.startswith("DUPLICATE_UTR")]
+            donation.fraud_reasons = reasons
+
+            # Validate syntax
+            is_custom = not clean_utr.isnumeric() or len(clean_utr) != 12
+            utr_check = ScreenshotFraudDetector.validate_utr_syntax(clean_utr, allow_custom_id=is_custom)
+            if not utr_check["is_valid"]:
+                donation.is_flagged_fraud = True
+                reasons = list(donation.fraud_reasons or [])
+                reasons.append(f"INVALID_UTR_SYNTAX: {utr_check['rejection_reason']}")
+                donation.fraud_reasons = reasons
+                donation.flagged_reason = utr_check["rejection_reason"]
+            else:
+                # If previously flagged only for UTR, clear
+                reasons = [r for r in (donation.fraud_reasons or []) if not r.startswith("INVALID_UTR_SYNTAX")]
+                donation.fraud_reasons = reasons
+                if not reasons:
+                    donation.is_flagged_fraud = False
+                    donation.flagged_reason = None
+
+            # Check if matching bank statement exists for this newly updated UTR
+            matching_stmt = db.query(BankStatementEntry).filter(
+                BankStatementEntry.extracted_utr == clean_utr
+            ).first()
+            if matching_stmt:
+                donation.status = DonationStatus.MATCHED
+                donation.is_verified = True
+                donation.matched_statement_id = matching_stmt.id
+                donation.bank_matched_mode = "MANUAL_EDIT_MATCH"
+                donation.verified_at = datetime.now(timezone.utc)
+                donation.verified_by_user = "INLINE_EDIT"
+                matching_stmt.is_reconciled = True
 
     if payload.extracted_amount is not None:
         donation.extracted_amount = payload.extracted_amount

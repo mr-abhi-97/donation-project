@@ -231,3 +231,21 @@ class ScreenshotFraudDetector:
                 "matched_anchors": [],
                 "confidence_score": 0.0
             }
+
+    @staticmethod
+    def check_duplicate_utr(db, utr: str, current_donation_id=None):
+        """
+        Queries SQLite database to check if a 12-digit UTR has already been registered.
+        Returns the original/earliest Donation record if duplicate exists, else None.
+        """
+        if not utr or not isinstance(utr, str):
+            return None
+        clean_utr = utr.strip()
+        if not clean_utr:
+            return None
+        from backend.app.models import Donation
+        query = db.query(Donation).filter(Donation.extracted_utr == clean_utr)
+        if current_donation_id:
+            query = query.filter(Donation.id != current_donation_id)
+        return query.order_by(Donation.created_at.asc()).first()
+

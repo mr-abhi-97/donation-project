@@ -1,0 +1,9 @@
+@echo off
+echo Killing old stuck processes...
+taskkill /F /IM python.exe 2>nul
+echo Starting FastAPI Backend on port 8000...
+start "Backend - Port 8000" cmd /k "cd /d E:\new try && .\backend\venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000"
+timeout /t 3 /nobreak >nul
+echo Starting Next.js Frontend on port 3000...
+start "Frontend - Port 3000" cmd /k "cd /d E:\new try\frontend && npm run dev"
+echo Done! Dono servers background windows mein live hain.

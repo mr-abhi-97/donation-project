@@ -75,6 +75,7 @@ class DonationStatus(str, enum.Enum):
     MATCHED = "MATCHED"
     SUCCESS = "SUCCESS"
     FLAGGED_REVIEW = "FLAGGED_REVIEW"
+    DUPLICATE_FLAGGED = "DUPLICATE_FLAGGED"
     REJECTED = "REJECTED"
 
 
@@ -124,6 +125,11 @@ class Donation(Base):
     is_flagged_fraud = Column(Boolean, default=False, index=True)
     fraud_reasons = Column(UniversalJSON(), default=list)
 
+    # Duplicate UTR Tracking & Reference Metadata
+    original_transaction_id = Column(GUID(), nullable=True, index=True)
+    original_transaction_hash = Column(String(64), nullable=True)
+    duplicate_metadata = Column(UniversalJSON(), nullable=True)
+
     # 2. CA Audit Trail (Mandatory for Form 10BD & 80G Inspection)
     verified_by_user = Column(String(100), nullable=True)  # Admin username or email
     verified_at = Column(DateTime, nullable=True)
@@ -142,6 +148,10 @@ class Donation(Base):
     __table_args__ = (
         Index('idx_verified_utr_status', 'extracted_utr', 'is_verified'),
     )
+
+    @property
+    def is_duplicate_utr(self) -> bool:
+        return self.status == DonationStatus.DUPLICATE_FLAGGED or bool(self.original_transaction_id)
 
     @property
     def donor_name(self) -> Optional[str]:

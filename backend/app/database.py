@@ -24,3 +24,24 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def ensure_db_schema(target_engine=None):
+    """
+    Ensures newly added columns exist in the SQLite database without requiring a manual migration tool.
+    Safe and idempotent.
+    """
+    eng = target_engine or engine
+    from sqlalchemy import inspect, text
+    inspector = inspect(eng)
+    if "donations" in inspector.get_table_names():
+        columns = [c["name"] for c in inspector.get_columns("donations")]
+        with eng.connect() as conn:
+            if "original_transaction_id" not in columns:
+                conn.execute(text("ALTER TABLE donations ADD COLUMN original_transaction_id VARCHAR(36)"))
+            if "original_transaction_hash" not in columns:
+                conn.execute(text("ALTER TABLE donations ADD COLUMN original_transaction_hash VARCHAR(64)"))
+            if "duplicate_metadata" not in columns:
+                conn.execute(text("ALTER TABLE donations ADD COLUMN duplicate_metadata TEXT"))
+            conn.commit()
+
