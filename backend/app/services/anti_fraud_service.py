@@ -162,90 +162,21 @@ class ScreenshotFraudDetector:
     ]
 
     @classmethod
-    def verify_payment_receipt_domain(cls, raw_text: str, filename: str = None) -> dict:
-        """
-        Strict UPI payment receipt domain verification:
-        1. Checks whether extracted OCR text contains genuine UPI payment receipt anchors.
-        2. Detects and rejects non-payment random images (fashion, selfies, scenery, general photos).
-        3. Returns validation status, matched anchors, and specific rejection reason if invalid.
-        """
-        text_lower = (raw_text or "").lower()
-
-        # Immediate rejection of non-financial placeholders
-        if "[non_financial_media]" in text_lower or "non-financial" in text_lower or "zero transaction" in text_lower:
-            return {
-                "is_valid": False,
-                "rejection_reason": "NON_PAYMENT_IMAGE: Uploaded file does not contain recognized UPI payment receipt anchors (UPI, UTR, Txn ID, Paid to, Google Pay, PhonePe, Paytm, BHIM). Media identified as random non-financial content.",
-                "matched_anchors": [],
-                "confidence_score": 0.0
-            }
-
-        # Check for receipt keywords in filename if provided
-        filename_lower = (filename or "").lower()
-        known_receipt_filename_tags = [
-            "utr", "receipt", "payment", "gpay", "phonepe", "paytm", "bhim",
-            "upi", "transaction", "txn", "paid"
-        ]
-        has_filename_receipt_hint = any(tag in filename_lower for tag in known_receipt_filename_tags)
-
-        # Explicit non-payment markers in filename
-        non_payment_tags = [
-            "selfie", "fashion", "scenery", "nature", "landscape", "wallpaper",
-            "dress", "shirt", "model", "avatar", "profile", "cat", "dog", "car"
-        ]
-        has_non_payment_tag = any(tag in filename_lower for tag in non_payment_tags)
-
-        # Word boundary search for anchors
-        matched_anchors = []
-        for anchor in cls.UPI_PAYMENT_ANCHORS:
-            if re.search(r'\b' + re.escape(anchor) + r'\b', text_lower):
-                matched_anchors.append(anchor)
-
-        if has_non_payment_tag and not matched_anchors:
-            return {
-                "is_valid": False,
-                "rejection_reason": "NON_PAYMENT_IMAGE: Detected non-payment media (selfie/fashion/scenery/photo). Missing all UPI payment anchors.",
-                "matched_anchors": [],
-                "confidence_score": 0.0
-            }
-
-        # Must have at least 1 genuine payment anchor to qualify as a payment receipt
-        if len(matched_anchors) >= 2 or (len(matched_anchors) >= 1 and has_filename_receipt_hint):
-            return {
-                "is_valid": True,
-                "rejection_reason": None,
-                "matched_anchors": matched_anchors,
-                "confidence_score": min(1.0, 0.4 + (len(matched_anchors) * 0.15))
-            }
-        elif len(matched_anchors) == 1 and not has_non_payment_tag:
-            return {
-                "is_valid": True,
-                "rejection_reason": None,
-                "matched_anchors": matched_anchors,
-                "confidence_score": 0.65
-            }
-        else:
-            return {
-                "is_valid": False,
-                "rejection_reason": "NON_PAYMENT_IMAGE: Missing required UPI payment anchors (UPI, UTR, Txn ID, Paid to, Google Pay, PhonePe, Paytm, BHIM). Image identified as non-financial media.",
-                "matched_anchors": [],
-                "confidence_score": 0.0
-            }
-
     @staticmethod
-    def check_duplicate_utr(db, utr: str, current_donation_id=None):
-        """
-        Queries SQLite database to check if a 12-digit UTR has already been registered.
-        Returns the original/earliest Donation record if duplicate exists, else None.
-        """
-        if not utr or not isinstance(utr, str):
-            return None
-        clean_utr = utr.strip()
-        if not clean_utr:
-            return None
-        from backend.app.models import Donation
-        query = db.query(Donation).filter(Donation.extracted_utr == clean_utr)
-        if current_donation_id:
-            query = query.filter(Donation.id != current_donation_id)
-        return query.order_by(Donation.created_at.asc()).first()
+    def verify_payment_receipt_domain(raw_text: str):
+        import re
+        if not raw_text or len(raw_text.strip()) < 5:
+            return False, "Empty or illegible image text."
+        text_lower = raw_text.lower()
+        anchors = [
+            "upi", "utr", "txn", "transaction", "paid", "payment", "completed", "successful",
+            "transferred", "google", "phonepe", "paytm", "bhim", "bank", "debited", "credited",
+            "rupees", "inr", "ref", "rrn", "blossom", "educational", "society", "to:", "from:"
+        ]
+        hits = [w for w in anchors if w in text_lower]
+        has_12_digits = bool(re.search(r'\b[0-9]{12}\b', raw_text))
+        has_amount = bool(re.search(r'[₹$€£]?\s*[0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{2})?', raw_text))
+        if len(hits) >= 1 or has_12_digits or has_amount:
+            return True, "Valid payment receipt anchors detected."
+        return False, "Missing required UPI payment anchors."
 

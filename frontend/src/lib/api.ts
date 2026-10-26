@@ -224,6 +224,40 @@ export const api = {
     return res.json();
   },
 
+  // Batch delete donations
+  async batchDeleteDonations(ids: string[]) {
+    const res = await fetch(`${API_BASE}/donations/batch-delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to batch delete donations' }));
+      throw new Error(err.detail || 'Failed to batch delete donations');
+    }
+    return res.json() as Promise<{ status: string; deleted_count: number; not_found_count: number; message: string }>;
+  },
+
+  // Reset entire ledger (nuclear option)
+  async resetLedger() {
+    const res = await fetch(`${API_BASE}/donations/reset-ledger`, {
+      method: 'POST',
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to reset ledger' }));
+      throw new Error(err.detail || 'Failed to reset ledger');
+    }
+    return res.json() as Promise<{
+      status: string;
+      donations_deleted: number;
+      receipts_deleted: number;
+      statements_deleted: number;
+      donors_deleted: number;
+      files_purged: number;
+      message: string;
+    }>;
+  },
+
   // Bank Statement upload
   async uploadBankStatement(file: File) {
     const formData = new FormData();

@@ -1,19 +1,12 @@
 from uuid import UUID
 from datetime import datetime, date
 from decimal import Decimal
-from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any, Union
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 import re
 
 from backend.app.models import DonationStatus
 from backend.app.utils.validators import normalize_indian_phone, validate_pan_format
-
-try:
-    from pydantic import validator
-    HAS_V1_VALIDATOR = True
-except ImportError:
-    from pydantic import field_validator
-    HAS_V1_VALIDATOR = False
 
 
 def to_pydantic(model_cls, obj):
@@ -29,14 +22,15 @@ class DonorBase(BaseModel):
     email: str = Field(..., description="Valid email address")
     address: Optional[str] = Field(None, description="Donor address for Form 10BD")
 
-    if HAS_V1_VALIDATOR:
-        @validator("pan_number")
-        def validate_pan(cls, v):
-            return validate_pan_format(v)
+    @field_validator("pan_number")
+    @classmethod
+    def validate_pan(cls, v):
+        return validate_pan_format(v)
 
-        @validator("phone")
-        def validate_phone(cls, v):
-            return normalize_indian_phone(v)
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v):
+        return normalize_indian_phone(v)
 
 
 class DonorCreate(DonorBase):
@@ -45,11 +39,9 @@ class DonorCreate(DonorBase):
 
 class DonorResponse(DonorBase):
     id: UUID
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
-    class Config:
-        orm_mode = True
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
 
 class BankStatementEntryBase(BaseModel):
@@ -71,11 +63,9 @@ class BankStatementEntryResponse(BankStatementEntryBase):
     is_balance_continuous: bool = True
     is_suspicious_pdf_source: bool = False
     math_discrepancy_details: Optional[Dict[str, Any]] = None
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
-    class Config:
-        orm_mode = True
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
 
 class TaxReceiptResponse(BaseModel):
@@ -86,11 +76,9 @@ class TaxReceiptResponse(BaseModel):
     eligible_amount: Decimal
     pdf_path: str
     pdf_url: str
-    issued_at: datetime
+    issued_at: Optional[datetime] = None
 
-    class Config:
-        orm_mode = True
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
 
 class DonationUpdate(BaseModel):
@@ -100,9 +88,9 @@ class DonationUpdate(BaseModel):
     status: Optional[DonationStatus] = None
     is_verified: Optional[bool] = None
     flagged_reason: Optional[str] = None
-    matched_statement_id: Optional[UUID] = None
+    matched_statement_id: Optional[str] = None
     admin_audit_notes: Optional[str] = None
-    original_transaction_id: Optional[UUID] = None
+    original_transaction_id: Optional[str] = None
     original_transaction_hash: Optional[str] = None
     duplicate_metadata: Optional[Dict[str, Any]] = None
 
@@ -125,7 +113,7 @@ class DonationResponse(BaseModel):
     raw_ocr_payload: Optional[Dict[str, Any]] = None
     ocr_confidence: float = 0.0
     status: DonationStatus
-    matched_statement_id: Optional[UUID] = None
+    matched_statement_id: Optional[str] = None
     matched_statement: Optional[BankStatementEntryResponse] = None
     is_verified: bool
     flagged_reason: Optional[str] = None
@@ -138,7 +126,7 @@ class DonationResponse(BaseModel):
     fraud_reasons: Optional[List[str]] = None
 
     # Duplicate UTR Tracking & Metadata
-    original_transaction_id: Optional[UUID] = None
+    original_transaction_id: Optional[str] = None
     original_transaction_hash: Optional[str] = None
     duplicate_metadata: Optional[Dict[str, Any]] = None
     is_duplicate_utr: bool = False
@@ -150,12 +138,34 @@ class DonationResponse(BaseModel):
     admin_audit_notes: Optional[str] = None
 
     tax_receipt: Optional[TaxReceiptResponse] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
-    class Config:
-        orm_mode = True
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    @field_validator("matched_statement_id", "original_transaction_id", "original_transaction_hash", "image_sha256", mode="before")
+    @classmethod
+    def coerce_to_str(cls, v):
+        if v is not None:
+            return str(v)
+        return None
+
+    @field_validator("extracted_date", "verified_at", "created_at", "updated_at", mode="before")
+    @classmethod
+    def coerce_datetime(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, (datetime, date)):
+            return v
+        if isinstance(v, str) and v.strip():
+            try:
+                return datetime.fromisoformat(v.strip().replace("Z", "+00:00"))
+            except Exception:
+                try:
+                    return datetime.strptime(v.strip(), "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    return None
+        return None
 
 
 class PublicDonationSubmissionResponse(BaseModel):
@@ -168,15 +178,20 @@ class PublicDonationSubmissionResponse(BaseModel):
     is_flagged_fraud: bool = False
     tamper_score: float = 0.0
     fraud_reasons: Optional[List[str]] = None
-    original_transaction_id: Optional[UUID] = None
+    original_transaction_id: Optional[str] = None
     original_transaction_hash: Optional[str] = None
     duplicate_metadata: Optional[Dict[str, Any]] = None
     is_duplicate_utr: bool = False
     message: str
 
-    class Config:
-        orm_mode = True
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    @field_validator("original_transaction_id", "original_transaction_hash", mode="before")
+    @classmethod
+    def coerce_to_str(cls, v):
+        if v is not None:
+            return str(v)
+        return None
 
 
 class ReconciliationStatsResponse(BaseModel):
@@ -214,3 +229,16 @@ class Form10BDItem(BaseModel):
     mode_of_receipt: str = "Electronic modes including UPI"
     amount: Decimal
     section: str = "Section 80G(5)(vi)"
+
+
+class BatchDeleteRequest(BaseModel):
+    ids: List[str]
+
+
+class BatchDeleteResponse(BaseModel):
+    status: str
+    deleted_count: int
+    not_found_count: int
+    message: str
+
+

@@ -45,8 +45,10 @@ interface DonationItem {
   donor_id?: string;
   donor?: DonorInfo;
   donor_name?: string;
-  extracted_utr: string;
-  extracted_amount: number;
+  extracted_utr?: string;
+  utr?: string;
+  extracted_amount?: number;
+  amount?: number;
   status: string;
   is_verified: boolean;
   screenshot_url?: string;
@@ -60,6 +62,7 @@ interface DonationItem {
   original_transaction_hash?: string;
   duplicate_metadata?: Record<string, any>;
   is_duplicate_utr?: boolean;
+  matched_statement_id?: string;
   matched_statement?: {
     narration: string;
     transaction_date: string;
@@ -84,6 +87,14 @@ export default function SingleScreenReconciliation() {
   const [statusNotification, setStatusNotification] = useState<{ message: string; type: "success" | "info" | "error" } | null>(null);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [error, setError] = useState<string>("");
+  // Multi-select & bulk operations
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
+  const [showBulkDeleteConfirm, setShowBulkDeleteConfirm] = useState(false);
+  const [isResettingLedger, setIsResettingLedger] = useState(false);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [statementError, setStatementError] = useState<string>("");
 
   const showNotification = (message: string, type: "success" | "info" | "error" = "info") => {
     setStatusNotification({ message, type });
@@ -107,15 +118,15 @@ export default function SingleScreenReconciliation() {
     }
   };
 
-  const fetchTransactions = async () => {
+        const fetchTransactions = async () => {
     try {
       const res = await fetch("/api/donations");
       if (res.ok) {
         const data = await res.json();
         setDonations(data);
       }
-    } catch (err) {
-      console.error("Failed to load transactions", err);
+    } catch (error) {
+      console.error("Failed to load donations ledger:", error);
     }
   };
 
@@ -156,7 +167,7 @@ export default function SingleScreenReconciliation() {
         const matchedUploaded = (resultData || []).some((item: DonationItem) => item.is_verified || item.status === "MATCHED");
         if (matchedUploaded) {
           fireConfetti();
-          showNotification(`Processed ${resultData.length} receipt(s) — Bank statement match verified! 🟢`, "success");
+          showNotification(`Processed ${resultData.length} receipt(s) ” Bank statement match verified! ðŸŸ¢`, "success");
         } else {
           showNotification(`Successfully processed ${resultData.length} receipt(s). Forensic inspection complete.`, "info");
         }
@@ -195,9 +206,84 @@ export default function SingleScreenReconciliation() {
     }
   };
 
+  // Multi-select helpers
+  const toggleSelectId = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    if (selectedIds.size === filtered.length && filtered.length > 0) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(filtered.map((d) => d.id)));
+    }
+  };
+
+  // Bulk delete selected
+  const handleBulkDelete = async () => {
+    if (selectedIds.size === 0) return;
+    setIsBulkDeleting(true);
+    try {
+      const res = await fetch("/api/donations/batch-delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: Array.from(selectedIds) }),
+      });
+      if (res.ok) {
+        const result = await res.json();
+        setSelectedIds(new Set());
+        setShowBulkDeleteConfirm(false);
+        await fetchTransactions();
+        showNotification(
+          `Bulk delete complete: ${result.deleted_count} record(s) removed${result.not_found_count > 0 ? `, ${result.not_found_count} not found` : ""}.`,
+          "success"
+        );
+      } else {
+        const err = await res.json().catch(() => ({ detail: "Bulk delete failed" }));
+        showNotification(`Bulk delete failed: ${err.detail || "Unknown error"}`, "error");
+      }
+    } catch (err) {
+      console.error("Bulk delete failed", err);
+      showNotification("Bulk delete failed. Check network connection.", "error");
+    } finally {
+      setIsBulkDeleting(false);
+    }
+  };
+
+  // Reset entire ledger
+  const handleResetLedger = async () => {
+    setIsResettingLedger(true);
+    try {
+      const res = await fetch("/api/donations/reset-ledger", { method: "POST" });
+      if (res.ok) {
+        const result = await res.json();
+        setSelectedIds(new Set());
+        setShowResetConfirm(false);
+        await fetchTransactions();
+        showNotification(result.message || "Ledger reset complete.", "success");
+      } else {
+        const err = await res.json().catch(() => ({ detail: "Reset failed" }));
+        showNotification(`Reset failed: ${err.detail || "Unknown error"}`, "error");
+      }
+    } catch (err) {
+      console.error("Reset ledger failed", err);
+      showNotification("Ledger reset failed. Check network connection.", "error");
+    } finally {
+      setIsResettingLedger(false);
+    }
+  };
+
   // 2. Upload Bank Statement & Trigger Auto-Match
-  const handleUploadStatement = async () => {
+  const handleReconcile = async () => {
     if (!statementFile) return;
+    setError("");
+    setStatementError("");
+    setStatusNotification(null);
     setLoadingStatement(true);
 
     const formData = new FormData();
@@ -213,19 +299,30 @@ export default function SingleScreenReconciliation() {
         setStatementFile(null);
         const input = document.getElementById("statement-input") as HTMLInputElement;
         if (input) input.value = "";
+        if (typeof window !== "undefined") {
+          window.open("http://127.0.0.1:8000/api/bank-statement/download-matched", "_blank");
+        }
         await fetchTransactions();
         showNotification("Bank statement reconciled successfully! 🎉 Matching UTR records updated.", "success");
       } else {
         const errData = await res.json().catch(() => ({ detail: "Failed to parse statement" }));
-        showNotification(`Statement error: ${errData.detail || "Upload failed"}`, "error");
+        const msg = errData.detail || "Upload failed";
+        setError(msg);
+        setStatementError(msg);
+        showNotification(`Statement error: ${msg}`, "error");
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error("Statement upload failed", err);
+      const msg = err?.message || "Statement upload failed. Please check file format.";
+      setError(msg);
+      setStatementError(msg);
       showNotification("Statement upload failed. Please check file format.", "error");
     } finally {
       setLoadingStatement(false);
     }
   };
+
+  const handleUploadStatement = handleReconcile;
 
   // 3. Inline Edit UTR in case of OCR misread
   const handleSaveUtr = async (donationId: string) => {
@@ -275,11 +372,12 @@ export default function SingleScreenReconciliation() {
 
   // Derived Stats
   const totalCount = donations.length;
-  const matchedList = donations.filter((d) => d.is_verified || d.status === "MATCHED");
-  const matchedCount = matchedList.length;
-  const pendingCount = totalCount - matchedCount;
-  const matchedAmount = matchedList.reduce((acc, curr) => acc + (Number(curr.extracted_amount) || 0), 0);
-  const totalAmount = donations.reduce((acc, curr) => acc + (Number(curr.extracted_amount) || 0), 0);
+  const matchedCount = donations.filter((d) => d.status === 'MATCHED' && d.matched_statement_id).length;
+  const pendingCount = donations.filter((d) => (d.status === 'EXTRACTED' || d.status === 'PENDING') && !d.matched_statement_id).length;
+  const matchedList = donations.filter((d) => d.status === 'MATCHED' && d.matched_statement_id);
+  const reconciledAmount = matchedList.reduce((acc, curr) => acc + (Number(curr.extracted_amount || curr.amount) || 0), 0);
+  const matchedAmount = reconciledAmount;
+  const totalAmount = donations.reduce((acc, curr) => acc + (Number(curr.extracted_amount || curr.amount) || 0), 0);
   const authenticCount = donations.filter((d) => !d.is_flagged_fraud && d.status !== "REJECTED" && (!d.tamper_score || d.tamper_score <= 25)).length;
   const flaggedCount = totalCount - authenticCount;
 
@@ -318,15 +416,22 @@ export default function SingleScreenReconciliation() {
               </div>
               <p className="text-xs text-slate-500 flex flex-wrap items-center gap-2 mt-1">
                 <span>Automated UPI Payment Proof Forensics</span>
-                <span>•</span>
+                <span>¢</span>
                 <span>Bank Statement Auto-Reconciler</span>
-                <span>•</span>
+                <span>¢</span>
                 <span className="text-indigo-600 font-medium font-mono">Regd No. 274409</span>
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-3">
+            <button
+              onClick={() => setShowResetConfirm(true)}
+              className="flex items-center gap-2 px-3.5 py-2 bg-rose-50 border border-rose-200 hover:border-rose-300 hover:bg-rose-100 text-xs text-rose-700 font-semibold rounded-xl transition shadow-2xs"
+              title="Reset entire ledger — deletes ALL records and uploaded files"
+            >
+              <Trash2 className="w-3.5 h-3.5 text-rose-500"/> Reset Ledger
+            </button>
             <a
               href="/api/bank-statement/sample-template"
               target="_blank"
@@ -441,7 +546,7 @@ export default function SingleScreenReconciliation() {
                 <UploadCloud className="w-8 h-8 mx-auto text-indigo-500 group-hover:scale-105 transition" />
                 <span className="text-sm font-semibold text-slate-800 block">
                   {screenshotFiles && screenshotFiles.length > 0
-                    ? `✓ ${screenshotFiles.length} file(s) selected`
+                    ? `✔“ ${screenshotFiles.length} file(s) selected`
                     : "Drag & drop receipts or browse"}
                 </span>
                 <span className="text-xs text-slate-500 block">
@@ -525,7 +630,7 @@ export default function SingleScreenReconciliation() {
               <label htmlFor="statement-input" className="cursor-pointer block space-y-2">
                 <FileSpreadsheet className="w-8 h-8 mx-auto text-emerald-600 group-hover:scale-105 transition" />
                 <span className="text-sm font-semibold text-slate-800 block">
-                  {statementFile ? `✓ ${statementFile.name}` : "Drag & drop Bank Statement file or browse"}
+                  {statementFile ? `✔“ ${statementFile.name}` : "Drag & drop Bank Statement file or browse"}
                 </span>
                 <span className="text-xs text-slate-500 block">
                   Matches UTR numbers from credit narrations automatically
@@ -534,7 +639,7 @@ export default function SingleScreenReconciliation() {
             </div>
 
             <button
-              onClick={handleUploadStatement}
+              onClick={handleReconcile}
               disabled={!statementFile || loadingStatement}
               className="w-full py-2.5 px-4 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 disabled:hover:bg-emerald-600 text-white rounded-xl text-sm font-semibold transition flex items-center justify-center gap-2 shadow-sm hover:shadow active:scale-98"
             >
@@ -565,7 +670,7 @@ export default function SingleScreenReconciliation() {
             <p className="text-2xl font-bold text-slate-900 mt-2">{totalCount} Receipts</p>
             <p className="text-[11px] text-slate-500 mt-0.5">
               <span className="text-emerald-700 font-semibold">{authenticCount} Authentic</span>
-              {flaggedCount > 0 && <span className="text-rose-600 font-semibold ml-1.5">• {flaggedCount} Flagged</span>}
+              {flaggedCount > 0 && <span className="text-rose-600 font-semibold ml-1.5">¢ {flaggedCount} Flagged</span>}
             </p>
           </div>
 
@@ -631,10 +736,47 @@ export default function SingleScreenReconciliation() {
             </div>
           </div>
 
+          {/* Floating Bulk Action Toolbar */}
+          {selectedIds.size > 0 && (
+            <div className="mx-4 mt-3 mb-1 p-3 bg-indigo-50 border border-indigo-200 rounded-xl flex items-center justify-between animate-in fade-in slide-in-from-top-2 shadow-sm">
+              <div className="flex items-center gap-3">
+                <span className="text-xs font-bold text-indigo-800">
+                  {selectedIds.size} record{selectedIds.size !== 1 ? "s" : ""} selected
+                </span>
+                <button
+                  onClick={() => setSelectedIds(new Set())}
+                  className="text-[11px] text-indigo-600 hover:text-indigo-800 underline font-medium transition"
+                >
+                  Clear selection
+                </button>
+              </div>
+              <button
+                onClick={() => setShowBulkDeleteConfirm(true)}
+                disabled={isBulkDeleting}
+                className="flex items-center gap-2 px-4 py-2 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white text-xs font-bold rounded-xl transition shadow-sm hover:shadow active:scale-98"
+              >
+                {isBulkDeleting ? (
+                  <><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Deleting...</>
+                ) : (
+                  <><Trash2 className="w-3.5 h-3.5" /> Delete Selected ({selectedIds.size})</>
+                )}
+              </button>
+            </div>
+          )}
+
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse text-sm">
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-100/70 text-slate-600 text-xs uppercase font-bold tracking-wider">
+                  <th className="py-3 px-3 w-10">
+                    <input
+                      type="checkbox"
+                      checked={filtered.length > 0 && selectedIds.size === filtered.length}
+                      onChange={toggleSelectAll}
+                      className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer accent-indigo-600"
+                      title="Select all / Deselect all"
+                    />
+                  </th>
                   <th className="py-3 px-4">#</th>
                   <th className="py-3 px-4">Proof</th>
                   <th className="py-3 px-4">Donor Name</th>
@@ -649,7 +791,7 @@ export default function SingleScreenReconciliation() {
               <tbody className="divide-y divide-slate-100">
                 {filtered.length === 0 ? (
                   <tr>
-                    <td colSpan={9} className="text-center py-20 text-slate-500">
+                    <td colSpan={10} className="text-center py-20 text-slate-500">
                       <div className="max-w-md mx-auto space-y-3">
                         <div className="w-14 h-14 mx-auto rounded-2xl bg-indigo-50 border border-indigo-100 flex items-center justify-center text-indigo-600 shadow-2xs">
                           <UploadCloud className="w-7 h-7" />
@@ -659,13 +801,15 @@ export default function SingleScreenReconciliation() {
                           Your live reconciliation ledger is currently clean. Upload UPI payment receipt screenshots on the left or drop an official bank statement on the right to start automated verification and matching.
                         </p>
                         <div className="inline-flex items-center gap-2 px-3 py-1 bg-slate-100 text-slate-600 rounded-full text-[11px] font-medium">
-                          <span>0 Pending</span> • <span>0 Reconciled</span> • <span>Ready to Ingest</span>
+                          <span>0 Pending</span> ¢ <span>0 Reconciled</span> ¢ <span>Ready to Ingest</span>
                         </div>
                       </div>
                     </td>
                   </tr>
                 ) : (
                   filtered.map((item, index) => {
+                    const itemUtr = item.extracted_utr || item.utr || "";
+                    const itemAmount = item.extracted_amount ?? item.amount;
                     const isNonPayment = item.status === "REJECTED" || (item.fraud_reasons && item.fraud_reasons.some(r => r.includes("NON_PAYMENT_IMAGE") || r.toLowerCase().includes("non-payment")));
                     const isDuplicateUtr = item.status === "DUPLICATE_FLAGGED" ||
                       Boolean(item.original_transaction_id) ||
@@ -680,7 +824,15 @@ export default function SingleScreenReconciliation() {
                     const donorDisplayName = isNonPayment ? "Unverified Uploader" : (item.donor?.full_name || item.donor_name || "Verified Donor");
 
                     return (
-                      <tr key={item.id} className="hover:bg-slate-50 transition group">
+                      <tr key={item.id} className={`hover:bg-slate-50 transition group ${selectedIds.has(item.id) ? "bg-indigo-50/50" : ""}`}>
+                        <td className="py-3.5 px-3">
+                          <input
+                            type="checkbox"
+                            checked={selectedIds.has(item.id)}
+                            onChange={() => toggleSelectId(item.id)}
+                            className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer accent-indigo-600"
+                          />
+                        </td>
                         <td className="py-3.5 px-4 text-slate-500 text-xs font-mono">{index + 1}</td>
                         
                         {/* Proof (Clickable thumbnail with popup preview modal) */}
@@ -717,7 +869,7 @@ export default function SingleScreenReconciliation() {
                           </div>
                         </td>
 
-                        {/* Proof Authenticity (🟢 Genuine vs ⚠️ Duplicate UTR vs 🔴 Duplicate Proof vs 🔴 Non-Payment) */}
+                        {/* Proof Authenticity (ðŸŸ¢ Genuine vs âš ï¸ Duplicate UTR vs ðŸ”´ Duplicate Proof vs ðŸ”´ Non-Payment) */}
                         <td className="py-3.5 px-4">
                           {isNonPayment ? (
                             <div className="flex flex-col gap-0.5" title={(item.fraud_reasons || []).join(" | ") || "Non-payment random image detected."}>
@@ -725,16 +877,16 @@ export default function SingleScreenReconciliation() {
                                 <ShieldAlert className="w-3.5 h-3.5 text-rose-600 flex-shrink-0" />
                                 <span>NON-PAYMENT / INVALID</span>
                               </span>
-                              <span className="text-[10px] text-rose-600 font-mono pl-1">Random media • No UPI data</span>
+                              <span className="text-[10px] text-rose-600 font-mono pl-1">Random media ¢ No UPI data</span>
                             </div>
                           ) : isDuplicateUtr ? (
                             <div className="flex flex-col gap-0.5" title={item.flagged_reason || (item.fraud_reasons && item.fraud_reasons.join(" | ")) || "Duplicate UTR detected: 12-digit UTR already registered in previous transaction."}>
                               <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-extrabold bg-amber-100 text-amber-900 border border-amber-300 shadow-xs animate-pulse">
                                 <AlertTriangle className="w-3.5 h-3.5 text-amber-600 flex-shrink-0" />
-                                <span>⚠️ DUPLICATE UTR DETECTED</span>
+                                <span>âš ï¸ DUPLICATE UTR DETECTED</span>
                               </span>
                               <span className="text-[10px] text-amber-800 font-mono pl-1 font-semibold">
-                                {item.original_transaction_id ? `Ref: Txn #${String(item.original_transaction_id).slice(0, 8)}` : "Possible Fraud • Double Claim"}
+                                {item.original_transaction_id ? `Ref: Txn #${String(item.original_transaction_id).slice(0, 8)}` : "Possible Fraud ¢ Double Claim"}
                               </span>
                             </div>
                           ) : isDuplicateHash ? (
@@ -751,7 +903,7 @@ export default function SingleScreenReconciliation() {
                                 <AlertTriangle className="w-3.5 h-3.5 text-amber-600 flex-shrink-0" />
                                 <span>EDITED / SUSPICIOUS</span>
                               </span>
-                              <span className="text-[10px] text-amber-700 font-mono pl-1">ELA: {scoreText} • Flagged</span>
+                              <span className="text-[10px] text-amber-700 font-mono pl-1">ELA: {scoreText} ¢ Flagged</span>
                             </div>
                           ) : (
                             <div className="flex flex-col gap-0.5" title="Passed Error Level Analysis (ELA) and uniqueness checks.">
@@ -759,7 +911,7 @@ export default function SingleScreenReconciliation() {
                                 <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 flex-shrink-0" />
                                 <span>GENUINE PROOF</span>
                               </span>
-                              <span className="text-[10px] text-emerald-600 font-mono pl-1">ELA: {scoreText} • Clean</span>
+                              <span className="text-[10px] text-emerald-600 font-mono pl-1">ELA: {scoreText} ¢ Clean</span>
                             </div>
                           )}
                         </td>
@@ -792,9 +944,9 @@ export default function SingleScreenReconciliation() {
                             </div>
                           ) : (
                             <div className="flex items-center gap-2">
-                              {item.extracted_utr ? (
+                              {itemUtr ? (
                                 <span className="font-mono font-bold text-slate-900 tracking-wide text-xs">
-                                  {item.extracted_utr}
+                                  {itemUtr}
                                 </span>
                               ) : (
                                 <span className="font-mono text-xs text-rose-600 italic font-medium">
@@ -803,9 +955,9 @@ export default function SingleScreenReconciliation() {
                               )}
 
                               {/* 1-Click Copy Button */}
-                              {item.extracted_utr && (
+                              {itemUtr && (
                                 <button
-                                  onClick={() => handleCopyUtr(item.extracted_utr, item.id)}
+                                  onClick={() => handleCopyUtr(itemUtr, item.id)}
                                   title={isCopied ? "Copied!" : "1-Click Copy UTR"}
                                   className={`p-1 rounded transition ${
                                     isCopied
@@ -822,11 +974,11 @@ export default function SingleScreenReconciliation() {
                               )}
 
                               {/* Inline Pencil Edit Button */}
-                              {item.extracted_utr && (
+                              {itemUtr && (
                                 <button
                                   onClick={() => {
                                     setEditingId(item.id);
-                                    setEditUtrValue(item.extracted_utr || "");
+                                    setEditUtrValue(itemUtr);
                                   }}
                                   title="Edit UTR if OCR misread"
                                   className="p-1 opacity-40 group-hover:opacity-80 hover:opacity-100 text-slate-500 hover:text-slate-800 transition"
@@ -840,14 +992,14 @@ export default function SingleScreenReconciliation() {
 
                         {/* Amount */}
                         <td className="py-3.5 px-4 font-bold text-slate-900">
-                          {item.extracted_amount ? (
-                            `₹${Number(item.extracted_amount || 0).toLocaleString("en-IN")}`
+                          {itemAmount !== undefined && itemAmount !== null ? (
+                            `₹${Number(itemAmount || 0).toLocaleString("en-IN")}`
                           ) : (
                             <span className="text-xs text-slate-400 font-normal italic">—</span>
                           )}
                         </td>
 
-                        {/* Bank Match Status (🟢 SUCCESS vs 🚫 BLOCKED (DUPLICATE) vs 🟡 PENDING vs 🔴 REJECTED) */}
+                        {/* Bank Match Status (ðŸŸ¢ SUCCESS vs ðŸš« BLOCKED (DUPLICATE) vs ðŸŸ¡ PENDING vs ðŸ”´ REJECTED) */}
                         <td className="py-3.5 px-4">
                           {isDuplicateUtr ? (
                             <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-rose-100 text-rose-800 border border-rose-300 shadow-2xs">
@@ -947,6 +1099,112 @@ export default function SingleScreenReconciliation() {
 
       </div>
 
+      {/* Bulk Delete Confirmation Modal */}
+      {showBulkDeleteConfirm && (
+        <div
+          className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in"
+          onClick={() => setShowBulkDeleteConfirm(false)}
+        >
+          <div
+            className="bg-white border border-slate-200 p-6 rounded-2xl max-w-md w-full relative shadow-xl space-y-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-3">
+              <div className="p-3 rounded-xl bg-rose-50 text-rose-600 border border-rose-200">
+                <Trash2 className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="font-bold text-slate-900 text-base">Confirm Bulk Deletion</h3>
+                <p className="text-xs text-slate-500 mt-0.5">This action cannot be undone.</p>
+              </div>
+            </div>
+            <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl">
+              <p className="text-sm text-rose-800 font-semibold">
+                You are about to permanently delete <span className="font-bold">{selectedIds.size}</span> donation record{selectedIds.size !== 1 ? "s" : ""}.
+              </p>
+              <p className="text-xs text-rose-600 mt-1">
+                Associated screenshots, tax receipts, and bank statement links will also be removed.
+              </p>
+            </div>
+            <div className="flex items-center justify-end gap-3 pt-1">
+              <button
+                onClick={() => setShowBulkDeleteConfirm(false)}
+                className="px-4 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl transition"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleBulkDelete}
+                disabled={isBulkDeleting}
+                className="px-5 py-2 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 disabled:opacity-50 rounded-xl transition shadow-sm flex items-center gap-2"
+              >
+                {isBulkDeleting ? (
+                  <><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Deleting...</>
+                ) : (
+                  <><Trash2 className="w-3.5 h-3.5" /> Delete {selectedIds.size} Record{selectedIds.size !== 1 ? "s" : ""}</>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Reset Ledger Confirmation Modal */}
+      {showResetConfirm && (
+        <div
+          className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in"
+          onClick={() => setShowResetConfirm(false)}
+        >
+          <div
+            className="bg-white border border-slate-200 p-6 rounded-2xl max-w-md w-full relative shadow-xl space-y-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-3">
+              <div className="p-3 rounded-xl bg-rose-100 text-rose-700 border border-rose-300">
+                <AlertTriangle className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="font-bold text-slate-900 text-base">Reset Entire Ledger</h3>
+                <p className="text-xs text-rose-600 font-semibold mt-0.5">⚠ DESTRUCTIVE ACTION</p>
+              </div>
+            </div>
+            <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl space-y-2">
+              <p className="text-sm text-rose-800 font-semibold">
+                This will permanently delete ALL data:
+              </p>
+              <ul className="text-xs text-rose-700 space-y-1 list-disc list-inside">
+                <li>All donation records & screenshot files</li>
+                <li>All tax receipts (80G certificates)</li>
+                <li>All bank statement entries</li>
+                <li>All donor records</li>
+              </ul>
+              <p className="text-xs text-rose-600 font-bold mt-2">
+                This cannot be undone. Back up your database first!
+              </p>
+            </div>
+            <div className="flex items-center justify-end gap-3 pt-1">
+              <button
+                onClick={() => setShowResetConfirm(false)}
+                className="px-4 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl transition"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleResetLedger}
+                disabled={isResettingLedger}
+                className="px-5 py-2 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 disabled:opacity-50 rounded-xl transition shadow-sm flex items-center gap-2"
+              >
+                {isResettingLedger ? (
+                  <><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Resetting...</>
+                ) : (
+                  <><Trash2 className="w-3.5 h-3.5" /> Yes, Reset Everything</>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Lightbox Image Preview Modal with Forensics Inspection Details */}
       {previewItem && (
         <div
@@ -987,10 +1245,10 @@ export default function SingleScreenReconciliation() {
                   <>
                     <AlertTriangle className="w-4 h-4 text-amber-600 flex-shrink-0" />
                     <div>
-                      <span className="font-bold">⚠️ DUPLICATE UTR DETECTED (POSSIBLE FRAUD)</span>
+                      <span className="font-bold">âš ï¸ DUPLICATE UTR DETECTED (POSSIBLE FRAUD)</span>
                       <p className="text-[11px] text-amber-800">
                         {(previewItem.fraud_reasons && previewItem.fraud_reasons.find(r => r.toLowerCase().includes("duplicate utr") || r.includes("DUPLICATE_UTR"))) || previewItem.flagged_reason || "12-digit UTR already registered in previous transaction."}
-                        {previewItem.original_transaction_id && ` • Original Ref ID: ${previewItem.original_transaction_id}`}
+                        {previewItem.original_transaction_id && ` ¢ Original Ref ID: ${previewItem.original_transaction_id}`}
                       </p>
                     </div>
                   </>
@@ -1000,7 +1258,7 @@ export default function SingleScreenReconciliation() {
                     <div>
                       <span className="font-bold">FLAGGED: Potential Tampering Detected</span>
                       <p className="text-[11px] text-rose-600">
-                        {(previewItem.fraud_reasons && previewItem.fraud_reasons.join(" • ")) || "Pixel tampering deviation detected."}
+                        {(previewItem.fraud_reasons && previewItem.fraud_reasons.join(" ¢ ")) || "Pixel tampering deviation detected."}
                       </p>
                     </div>
                   </>
@@ -1059,3 +1317,4 @@ export default function SingleScreenReconciliation() {
     </div>
   );
 }
+

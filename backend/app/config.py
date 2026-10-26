@@ -1,10 +1,7 @@
 import os
 from pathlib import Path
 
-try:
-    from pydantic_settings import BaseSettings
-except ImportError:
-    from pydantic import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -42,8 +39,7 @@ class Settings(BaseSettings):
     NGO_PHONE: str = "+91 11 4567 8900"
     CURRENT_FINANCIAL_YEAR: str = "2024-2025"
 
-    class Config:
-        case_sensitive = True
+    model_config = SettingsConfigDict(case_sensitive=True, extra="allow")
 
 settings = Settings()
 

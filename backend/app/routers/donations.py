@@ -1,10 +1,12 @@
 import os
+from pathlib import Path
 import uuid
 import zipfile
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Query, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from backend.app.config import settings
@@ -12,7 +14,7 @@ from backend.app.database import get_db
 from backend.app.models import Donation, Donor, BankStatementEntry, TaxReceipt80G, DonationStatus
 from backend.app.schemas import (
     DonationResponse, DonationUpdate, PublicDonationSubmissionResponse, DonorResponse, 
-    VerifyDonationRequest, to_pydantic
+    VerifyDonationRequest, BatchDeleteRequest, to_pydantic
 )
 from backend.app.services.storage_service import StorageService
 from backend.app.services.ocr_service import OCRService
@@ -174,7 +176,7 @@ async def public_submit_donation(
         status_val = DonationStatus.FLAGGED_REVIEW
         flagged_reason = " | ".join(fraud_reasons)
     else:
-        status_val = DonationStatus(ocr_result.get("status", "EXTRACTED"))
+        status_val = DonationStatus.EXTRACTED
         flagged_reason = None
 
     # 9. Create Donation record
@@ -317,13 +319,6 @@ def _process_single_image(img_data: bytes, filename: str, fixed_donor: Optional[
                     f"DUPLICATE_UTR: 12-digit UTR '{extracted_utr}' already exists in transaction {original_tx_id} (Hash: {original_tx_hash or 'N/A'}). Potential recycling fraud / duplicate submission."
                 )
 
-        # Check if a bank statement entry already exists for this UTR ONLY IF NOT DUPLICATE
-        matching_stmt = None
-        if extracted_utr and is_valid_receipt and not existing_dup_entry:
-            matching_stmt = db.query(BankStatementEntry).filter(
-                BankStatementEntry.extracted_utr == extracted_utr
-            ).first()
-
         extracted_amount_val = None
         if not is_valid_receipt or ocr_res.get("status") == "REJECTED":
             status_val = DonationStatus.REJECTED
@@ -335,30 +330,21 @@ def _process_single_image(img_data: bytes, filename: str, fixed_donor: Optional[
             status_val = DonationStatus.DUPLICATE_FLAGGED
             is_verified_val = False
             matched_stmt_id = None
-            if ocr_res.get("extracted_amount"):
-                try:
-                    extracted_amount_val = Decimal(str(ocr_res["extracted_amount"]))
-                except Exception:
-                    extracted_amount_val = None
-        elif matching_stmt:
-            status_val = DonationStatus.MATCHED
-            is_verified_val = True
-            matched_stmt_id = matching_stmt.id
-            matching_stmt.is_reconciled = True
-            if ocr_res.get("extracted_amount"):
-                try:
-                    extracted_amount_val = Decimal(str(ocr_res["extracted_amount"]))
-                except Exception:
-                    extracted_amount_val = None
-        else:
-            status_val = DonationStatus.FLAGGED_REVIEW if is_fraud else DonationStatus.EXTRACTED
+        elif is_fraud:
+            status_val = DonationStatus.FLAGGED_REVIEW
             is_verified_val = False
             matched_stmt_id = None
-            if ocr_res.get("extracted_amount"):
-                try:
-                    extracted_amount_val = Decimal(str(ocr_res["extracted_amount"]))
-                except Exception:
-                    extracted_amount_val = None
+        else:
+            # Invariant: Payment screenshots remain strictly at status = 'EXTRACTED' (Awaiting bank credit)
+            status_val = DonationStatus.EXTRACTED
+            is_verified_val = False
+            matched_stmt_id = None
+
+        if ocr_res.get("extracted_amount") and status_val != DonationStatus.REJECTED:
+            try:
+                extracted_amount_val = Decimal(str(ocr_res["extracted_amount"]))
+            except Exception:
+                extracted_amount_val = None
 
         extracted_date_val = None
         if ocr_res.get("extracted_date"):
@@ -495,14 +481,16 @@ async def bulk_upload_screenshots(
     return result_donations
 
 
+@router.get("", response_model=List[DonationResponse])
 @router.get("/", response_model=List[DonationResponse])
 def list_donations(
-    status: Optional[str] = Query(None, description="Filter by status (MATCHED, EXTRACTED, FLAGGED_REVIEW, REJECTED)"),
-    is_verified: Optional[bool] = Query(None),
-    is_flagged_fraud: Optional[bool] = Query(None),
-    search: Optional[str] = Query(None, description="Search by UTR or Donor Name / PAN"),
+    skip: int = 0,
     limit: int = 200,
-    offset: int = 0,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    is_verified: Optional[bool] = None,
+    is_flagged_fraud: Optional[bool] = None,
+    offset: Optional[int] = None,
     db: Session = Depends(get_db)
 ):
     query = db.query(Donation).options(
@@ -511,28 +499,182 @@ def list_donations(
         joinedload(Donation.tax_receipt)
     )
 
-    if status and status.upper() != "ALL":
-        try:
-            enum_status = DonationStatus(status.upper())
-            query = query.filter(Donation.status == enum_status)
-        except ValueError:
-            pass
+    status_val = status if isinstance(status, str) else None
+    if status_val and status_val.upper() != "ALL":
+        query = query.filter(Donation.status == status_val.upper())
 
-    if is_verified is not None:
-        query = query.filter(Donation.is_verified == is_verified)
-
-    if is_flagged_fraud is not None:
-        query = query.filter(Donation.is_flagged_fraud == is_flagged_fraud)
-
-    if search:
-        s = f"%{search.strip()}%"
-        query = query.join(Donation.donor, isouter=True).filter(
-            (Donation.extracted_utr.ilike(s)) |
-            (Donor.full_name.ilike(s)) |
-            (Donor.pan_number.ilike(s))
+    search_val = search if isinstance(search, str) else None
+    if search_val and search_val.strip():
+        s = f"%{search_val.strip()}%"
+        query = query.filter(
+            or_(
+                Donation.extracted_utr.ilike(s),
+                Donation.flagged_reason.ilike(s)
+            )
         )
 
-    return query.order_by(Donation.created_at.desc()).offset(offset).limit(limit).all()
+    if isinstance(is_verified, bool):
+        query = query.filter(Donation.is_verified == is_verified)
+
+    if isinstance(is_flagged_fraud, bool):
+        query = query.filter(Donation.is_flagged_fraud == is_flagged_fraud)
+
+    effective_skip = offset if isinstance(offset, int) and offset >= 0 else skip
+    offset_val = effective_skip if isinstance(effective_skip, int) and effective_skip >= 0 else 0
+    limit_val = limit if isinstance(limit, int) and limit > 0 else 200
+
+    return query.order_by(Donation.created_at.desc()).offset(offset_val).limit(limit_val).all()
+
+
+@router.post("/batch-delete", status_code=status.HTTP_200_OK)
+@router.delete("/batch-delete", status_code=status.HTTP_200_OK)
+def batch_delete_donations(
+    payload: BatchDeleteRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Batch-delete multiple donation records by ID list.
+    For each donation:
+      1. Unlinks any matched bank statement entry (sets is_reconciled=False).
+      2. Deletes associated TaxReceipt80G record.
+      3. Removes the screenshot file from disk if it exists.
+      4. Deletes the Donation row itself.
+    Returns counts of deleted vs not-found IDs.
+    """
+
+    if not payload.ids or len(payload.ids) == 0:
+        raise HTTPException(status_code=400, detail="ids list cannot be empty")
+
+    deleted_count = 0
+    not_found_count = 0
+
+    for raw_id in payload.ids:
+        try:
+            parsed_id = uuid.UUID(str(raw_id))
+        except (ValueError, TypeError):
+            parsed_id = raw_id
+
+        donation = db.query(Donation).filter(
+            (Donation.id == raw_id) | (Donation.id == parsed_id)
+        ).first()
+
+        if not donation:
+            not_found_count += 1
+            continue
+
+        # 1. Unlink matched bank statement
+        if donation.matched_statement_id:
+            stmt = db.query(BankStatementEntry).filter(
+                BankStatementEntry.id == donation.matched_statement_id
+            ).first()
+            if stmt:
+                stmt.is_reconciled = False
+
+        # 2. Delete associated tax receipt
+        db.query(TaxReceipt80G).filter(
+            (TaxReceipt80G.donation_id == donation.id) | (TaxReceipt80G.donation_id == str(donation.id))
+        ).delete(synchronize_session=False)
+
+        # 3. Remove screenshot file from disk
+        if donation.screenshot_url:
+            try:
+                raw_path = Path(donation.screenshot_url)
+                if raw_path.is_absolute() and raw_path.exists():
+                    raw_path.unlink()
+                    logger.info(f"Deleted screenshot file (abs): {raw_path}")
+                else:
+                    rel_path = donation.screenshot_url.lstrip("/").replace("\\", "/")
+                    if rel_path.startswith("uploads/"):
+                        abs_path = settings.UPLOAD_DIR.parent / rel_path
+                    else:
+                        abs_path = settings.UPLOAD_DIR / rel_path
+                    if abs_path.exists():
+                        abs_path.unlink()
+                        logger.info(f"Deleted screenshot file: {abs_path}")
+            except Exception as file_err:
+                logger.warning(f"Could not delete screenshot file for donation {donation.id}: {file_err}")
+
+        # 4. Delete the donation record
+        db.delete(donation)
+        deleted_count += 1
+
+    try:
+        db.commit()
+    except Exception as db_err:
+        db.rollback()
+        logger.error(f"Database error during batch delete commit: {db_err}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error during batch delete: {str(db_err)}"
+        )
+
+    return {
+        "status": "success",
+        "success": True,
+        "deleted_count": deleted_count,
+        "not_found_count": not_found_count,
+        "message": f"Batch delete complete: {deleted_count} deleted, {not_found_count} not found."
+    }
+
+
+@router.post("/reset-ledger", status_code=status.HTTP_200_OK)
+@router.delete("/reset-ledger", status_code=status.HTTP_200_OK)
+def reset_ledger(db: Session = Depends(get_db)):
+    """
+    Nuclear reset: Wipes ALL donation records, tax receipts, bank statement entries,
+    orphaned donors, and removes all uploaded files (screenshots, receipts, statements).
+    Returns summary counts of rows and files purged.
+    """
+    try:
+        # Count rows before deletion for audit summary
+        donation_count = db.query(Donation).count()
+        receipt_count = db.query(TaxReceipt80G).count()
+        statement_count = db.query(BankStatementEntry).count()
+        donor_count = db.query(Donor).count()
+
+        # Delete in foreign-key safe order
+        db.query(TaxReceipt80G).delete(synchronize_session=False)
+        db.query(Donation).delete(synchronize_session=False)
+        db.query(BankStatementEntry).delete(synchronize_session=False)
+        db.query(Donor).delete(synchronize_session=False)
+        db.commit()
+
+        # Purge all uploaded files from disk
+        files_purged = 0
+        for subdir_name in ["screenshots", "receipts", "statements"]:
+            subdir = settings.UPLOAD_DIR / subdir_name
+            if subdir.exists():
+                for fpath in subdir.iterdir():
+                    if fpath.is_file() and fpath.name != ".gitkeep":
+                        try:
+                            fpath.unlink()
+                            files_purged += 1
+                        except Exception as f_err:
+                            logger.warning(f"Could not delete file {fpath}: {f_err}")
+
+        logger.info(
+            f"LEDGER RESET: Purged {donation_count} donations, {receipt_count} receipts, "
+            f"{statement_count} statements, {donor_count} donors, {files_purged} files."
+        )
+
+        return {
+            "status": "success",
+            "success": True,
+            "deleted_count": donation_count,
+            "donations_deleted": donation_count,
+            "receipts_deleted": receipt_count,
+            "statements_deleted": statement_count,
+            "donors_deleted": donor_count,
+            "files_purged": files_purged,
+            "message": f"Ledger reset complete. Purged {donation_count} donations, {receipt_count} receipts, {statement_count} statements, {donor_count} donors, {files_purged} files."
+        }
+    except Exception as err:
+        db.rollback()
+        logger.error(f"Ledger reset failed: {err}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ledger reset failed: {str(err)}"
+        )
 
 
 @router.get("/{donation_id}", response_model=DonationResponse)
@@ -830,4 +972,5 @@ def delete_donation(donation_id: str, db: Session = Depends(get_db)):
     db.delete(donation)
     db.commit()
     return {"status": "success", "message": f"Donation {donation_id} deleted successfully"}
+
 

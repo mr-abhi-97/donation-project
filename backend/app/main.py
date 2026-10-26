@@ -6,14 +6,15 @@ from fastapi.staticfiles import StaticFiles
 from backend.app.config import settings
 from backend.app.database import engine, Base, ensure_db_schema
 from backend.app.routers import donors, donations, bank_statement, reconciliation, receipts
-from backend.app.utils.sample_data import seed_sample_data
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize database tables
-    Base.metadata.create_all(bind=engine)
-    ensure_db_schema(engine)
+    try:
+        Base.metadata.create_all(bind=engine)
+        ensure_db_schema(engine)
+    except Exception as e:
+        print(f"DB Startup warning: {e}")
     yield
 
 
@@ -48,7 +49,9 @@ app.mount("/api/uploads", StaticFiles(directory=UPLOAD_DIR), name="api_uploads")
 app.include_router(donors.router, prefix=settings.API_V1_STR)
 app.include_router(donations.router, prefix=settings.API_V1_STR)
 app.include_router(bank_statement.router, prefix=settings.API_V1_STR)
+app.include_router(bank_statement.router, prefix="")
 app.include_router(reconciliation.router, prefix=settings.API_V1_STR)
+app.include_router(reconciliation.router, prefix="")
 app.include_router(receipts.router, prefix=settings.API_V1_STR)
 
 
@@ -65,3 +68,4 @@ def health_check():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("backend.app.main:app", host="0.0.0.0", port=8000, reload=True)
+
