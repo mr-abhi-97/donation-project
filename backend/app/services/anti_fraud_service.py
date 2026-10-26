@@ -3,6 +3,7 @@ import io
 import re
 import base64
 import numpy as np
+from typing import Optional, Dict, Any, List
 from PIL import Image, ImageChops, ImageEnhance
 
 
@@ -161,22 +162,33 @@ class ScreenshotFraudDetector:
         "google pay", "phonepe", "paytm", "bhim", "banking name", "bank", "amount", "rupees", "inr"
     ]
 
-    @classmethod
     @staticmethod
-    def verify_payment_receipt_domain(raw_text: str):
+    def verify_payment_receipt_domain(raw_text: str, filename: Optional[str] = None) -> dict:
         import re
-        if not raw_text or len(raw_text.strip()) < 5:
-            return False, "Empty or illegible image text."
-        text_lower = raw_text.lower()
+        if not raw_text or len(str(raw_text).strip()) < 5:
+            return {
+                "is_valid": False,
+                "rejection_reason": "Empty or illegible image text."
+            }
+        text_lower = str(raw_text).lower()
         anchors = [
             "upi", "utr", "txn", "transaction", "paid", "payment", "completed", "successful",
             "transferred", "google", "phonepe", "paytm", "bhim", "bank", "debited", "credited",
-            "rupees", "inr", "ref", "rrn", "blossom", "educational", "society", "to:", "from:"
+            "rupees", "inr", "ref", "rrn", "blossom", "educational", "society", "to:", "from:",
+            "order", "amount"
         ]
         hits = [w for w in anchors if w in text_lower]
-        has_12_digits = bool(re.search(r'\b[0-9]{12}\b', raw_text))
-        has_amount = bool(re.search(r'[₹$€£]?\s*[0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{2})?', raw_text))
+        has_12_digits = bool(re.search(r'\b[0-9]{12}\b', str(raw_text)))
+        has_amount = bool(re.search(r'[₹$€£]?\s*[0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{2})?', str(raw_text)))
         if len(hits) >= 1 or has_12_digits or has_amount:
-            return True, "Valid payment receipt anchors detected."
-        return False, "Missing required UPI payment anchors."
+            return {
+                "is_valid": True,
+                "rejection_reason": None,
+                "hits": hits
+            }
+        return {
+            "is_valid": False,
+            "rejection_reason": "Missing required UPI payment anchors."
+        }
+
 

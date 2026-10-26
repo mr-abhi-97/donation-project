@@ -95,6 +95,8 @@ export default function SingleScreenReconciliation() {
   const [isResettingLedger, setIsResettingLedger] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [statementError, setStatementError] = useState<string>("");
+  const [loadingLedger, setLoadingLedger] = useState(false);
+  const [ledgerError, setLedgerError] = useState<string>("");
 
   const showNotification = (message: string, type: "success" | "info" | "error" = "info") => {
     setStatusNotification({ message, type });
@@ -118,15 +120,26 @@ export default function SingleScreenReconciliation() {
     }
   };
 
-        const fetchTransactions = async () => {
+  const fetchTransactions = async () => {
+    setLoadingLedger(true);
+    setLedgerError("");
     try {
-      const res = await fetch("/api/donations");
+      const res = await fetch("/api/donations", { cache: "no-store" });
       if (res.ok) {
         const data = await res.json();
-        setDonations(data);
+        const list = Array.isArray(data) ? data : (data?.donations || []);
+        setDonations(list);
+      } else {
+        const errJson = await res.json().catch(() => null);
+        const errMsg = errJson?.message || `Failed to load ledger (${res.status})`;
+        setLedgerError(errMsg);
+        console.error("Failed to load donations ledger:", errMsg);
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to load donations ledger:", error);
+      setLedgerError(error?.message || "Connection error loading donations ledger");
+    } finally {
+      setLoadingLedger(false);
     }
   };
 
@@ -163,16 +176,20 @@ export default function SingleScreenReconciliation() {
         
         await fetchTransactions();
         
+        const list: DonationItem[] = Array.isArray(resultData) ? resultData : (resultData?.donations || []);
+        const count = resultData?.processed_count ?? list.length;
+        
         // Check if any uploaded screenshot instantly matched
-        const matchedUploaded = (resultData || []).some((item: DonationItem) => item.is_verified || item.status === "MATCHED");
+        const matchedUploaded = list.some((item: DonationItem) => item.is_verified || item.status === "MATCHED");
         if (matchedUploaded) {
           fireConfetti();
-          showNotification(`Processed ${resultData.length} receipt(s) ” Bank statement match verified! ðŸŸ¢`, "success");
+          showNotification(`Processed ${count} receipt(s) — Bank statement match verified! 🟢`, "success");
         } else {
-          showNotification(`Successfully processed ${resultData.length} receipt(s). Forensic inspection complete.`, "info");
+          showNotification(resultData?.message || `Successfully processed ${count} receipt(s). Forensic inspection complete.`, "info");
         }
       } else {
-        const errText = await res.text();
+        const errJson = await res.json().catch(() => null);
+        const errText = errJson?.message || await res.text().catch(() => "Unknown upload error");
         showNotification(`Upload failed: ${errText}`, "error");
       }
     } catch (err) {
@@ -789,7 +806,33 @@ export default function SingleScreenReconciliation() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {filtered.length === 0 ? (
+                {loadingLedger ? (
+                  <tr>
+                    <td colSpan={10} className="text-center py-20 text-slate-500">
+                      <div className="max-w-md mx-auto space-y-3">
+                        <RefreshCw className="w-8 h-8 mx-auto text-indigo-600 animate-spin" />
+                        <h4 className="font-bold text-slate-800 text-base">Loading Donations Ledger...</h4>
+                        <p className="text-xs text-slate-500">Synchronizing records from FastAPI database.</p>
+                      </div>
+                    </td>
+                  </tr>
+                ) : ledgerError ? (
+                  <tr>
+                    <td colSpan={10} className="text-center py-16 text-rose-600">
+                      <div className="max-w-md mx-auto space-y-3 p-6 bg-rose-50 border border-rose-200 rounded-2xl">
+                        <AlertTriangle className="w-8 h-8 mx-auto text-rose-500" />
+                        <h4 className="font-bold text-rose-900 text-base">Error Loading Ledger</h4>
+                        <p className="text-xs text-rose-700">{ledgerError}</p>
+                        <button
+                          onClick={fetchTransactions}
+                          className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-semibold transition"
+                        >
+                          Retry Synchronization
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ) : filtered.length === 0 ? (
                   <tr>
                     <td colSpan={10} className="text-center py-20 text-slate-500">
                       <div className="max-w-md mx-auto space-y-3">
@@ -801,7 +844,7 @@ export default function SingleScreenReconciliation() {
                           Your live reconciliation ledger is currently clean. Upload UPI payment receipt screenshots on the left or drop an official bank statement on the right to start automated verification and matching.
                         </p>
                         <div className="inline-flex items-center gap-2 px-3 py-1 bg-slate-100 text-slate-600 rounded-full text-[11px] font-medium">
-                          <span>0 Pending</span> ¢ <span>0 Reconciled</span> ¢ <span>Ready to Ingest</span>
+                          <span>0 Pending</span> • <span>0 Reconciled</span> • <span>Ready to Ingest</span>
                         </div>
                       </div>
                     </td>

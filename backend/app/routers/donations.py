@@ -4,7 +4,7 @@ import uuid
 import zipfile
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Union
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Query, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
@@ -384,101 +384,131 @@ def _process_single_image(img_data: bytes, filename: str, fixed_donor: Optional[
         return None
 
 
-@router.post("/bulk-upload", response_model=List[DonationResponse])
+@router.post("/bulk-upload", status_code=status.HTTP_200_OK)
 async def bulk_upload_screenshots(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
     donor_name: Optional[str] = Form(None),
     db: Session = Depends(get_db)
-):
+) -> Dict[str, Any]:
     """
     Admin Bulk Screenshot Upload endpoint with Anti-Fraud Inspection and automated Donor attribution.
-    - If donor_name is provided in the form, assign it to uploaded screenshots.
-    - If no name is provided, automatically extract Payer/Sender name from OCR and link the Donor.
+    - Accepts multi-file uploads or ZIP archives containing receipt screenshots.
+    - Wraps file processing in strict try-except blocks to prevent unhandled exceptions and socket drops.
+    - Extracts ZIP archives securely to backend/uploads/screenshots/ and runs OCR forensics.
+    - Returns clean JSON with success status, processed count, and extracted donations list.
     """
-    # Ensure screenshots upload directory exists and is writable
-    os.makedirs("backend/uploads/screenshots", exist_ok=True)
-    settings.SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    created_donations = []
-    has_fixed_donor = bool(donor_name and donor_name.strip())
-    fixed_donor = None
-    if has_fixed_donor:
-        clean_donor_name = donor_name.strip()
-        fixed_donor = Donor(
-            id=uuid.uuid4(),
-            full_name=clean_donor_name,
-            pan_number="AAAAA0000A",
-            phone="+919876543210",
-            email=f"donor_{uuid.uuid4().hex[:6]}@raiseindia.org"
-        )
-        db.add(fixed_donor)
-        try:
-            db.flush()
-        except Exception as d_err:
-            db.rollback()
-            logger.error(f"Error creating fixed donor: {d_err}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to initialize donor: {str(d_err)}"
-            )
-
-    for f in files:
-        try:
-            filename = f.filename or "screenshot.png"
-            filename_lower = filename.lower()
-
-            # Check if zip archive
-            if filename_lower.endswith(".zip"):
-                file_bytes = await f.read()
-                import io
-                try:
-                    with zipfile.ZipFile(io.BytesIO(file_bytes), 'r') as zip_ref:
-                        for member in zip_ref.namelist():
-                            try:
-                                if member.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.jfif', '.bmp')) and not member.startswith('__MACOSX'):
-                                    img_data = zip_ref.read(member)
-                                    member_name = os.path.basename(member)
-                                    don = _process_single_image(img_data, member_name, fixed_donor, db)
-                                    if don:
-                                        created_donations.append(don)
-                            except Exception as member_err:
-                                logger.error(f"Error processing zip member '{member}': {member_err}", exc_info=True)
-                                continue
-                except Exception as zip_err:
-                    logger.error(f"Error reading zip archive '{filename}': {zip_err}", exc_info=True)
-                    continue
-            else:
-                img_data = await f.read()
-                don = _process_single_image(img_data, filename, fixed_donor, db)
-                if don:
-                    created_donations.append(don)
-        except Exception as file_err:
-            logger.error(f"Failed processing file '{getattr(f, 'filename', 'unknown')}': {file_err}", exc_info=True)
-            continue
-
     try:
-        db.commit()
-    except Exception as db_err:
-        db.rollback()
-        logger.error(f"Database error during bulk upload commit: {db_err}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database operational error during bulk upload: {str(db_err)}"
-        )
+        # Ensure screenshots upload directory exists and is writable
+        os.makedirs("backend/uploads/screenshots", exist_ok=True)
+        settings.SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    ids = [d.id for d in created_donations]
-    result_donations = []
-    if ids:
-        result_donations = db.query(Donation).options(
-            joinedload(Donation.donor),
-            joinedload(Donation.matched_statement),
-            joinedload(Donation.tax_receipt)
-        ).filter(Donation.id.in_(ids)).order_by(Donation.created_at.desc()).all()
+        created_donations = []
+        has_fixed_donor = bool(donor_name and donor_name.strip())
+        fixed_donor = None
+        if has_fixed_donor:
+            clean_donor_name = donor_name.strip()
+            fixed_donor = Donor(
+                id=uuid.uuid4(),
+                full_name=clean_donor_name,
+                pan_number="AAAAA0000A",
+                phone="+919876543210",
+                email=f"donor_{uuid.uuid4().hex[:6]}@raiseindia.org"
+            )
+            db.add(fixed_donor)
+            try:
+                db.flush()
+            except Exception as d_err:
+                db.rollback()
+                logger.error(f"Error creating fixed donor: {d_err}")
+                fixed_donor = None
 
-    # Enqueue background reconciliation safely
-    background_tasks.add_task(ReconciliationService.run_reconciliation)
-    return result_donations
+        for f in files:
+            try:
+                filename = f.filename or "screenshot.png"
+                filename_lower = filename.lower()
+
+                # Check if zip archive
+                if filename_lower.endswith(".zip"):
+                    file_bytes = await f.read()
+                    import io
+                    try:
+                        with zipfile.ZipFile(io.BytesIO(file_bytes), 'r') as zip_ref:
+                            for member in zip_ref.namelist():
+                                try:
+                                    if member.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.jfif', '.bmp')) and not member.startswith(('__MACOSX', '.')):
+                                        img_data = zip_ref.read(member)
+                                        member_name = os.path.basename(member)
+                                        if img_data and len(img_data) > 0:
+                                            don = _process_single_image(img_data, member_name, fixed_donor, db)
+                                            if don:
+                                                created_donations.append(don)
+                                except Exception as member_err:
+                                    logger.error(f"Error processing zip member '{member}': {member_err}", exc_info=True)
+                                    continue
+                    except Exception as zip_err:
+                        logger.error(f"Error reading zip archive '{filename}': {zip_err}", exc_info=True)
+                        continue
+                else:
+                    img_data = await f.read()
+                    if img_data and len(img_data) > 0:
+                        don = _process_single_image(img_data, filename, fixed_donor, db)
+                        if don:
+                            created_donations.append(don)
+            except Exception as file_err:
+                logger.error(f"Failed processing file '{getattr(f, 'filename', 'unknown')}': {file_err}", exc_info=True)
+                continue
+
+        try:
+            db.commit()
+        except Exception as db_err:
+            db.rollback()
+            logger.error(f"Database error during bulk upload commit: {db_err}", exc_info=True)
+            return {
+                "success": False,
+                "message": f"Database error during bulk upload: {str(db_err)}",
+                "processed_count": 0,
+                "donations": []
+            }
+
+        ids = [d.id for d in created_donations]
+        result_donations = []
+        if ids:
+            result_donations = db.query(Donation).options(
+                joinedload(Donation.donor),
+                joinedload(Donation.matched_statement),
+                joinedload(Donation.tax_receipt)
+            ).filter(Donation.id.in_(ids)).order_by(Donation.created_at.desc()).all()
+
+        # Enqueue background reconciliation safely
+        try:
+            background_tasks.add_task(ReconciliationService.run_reconciliation)
+        except Exception as bg_err:
+            logger.warning(f"Failed to enqueue reconciliation background task: {bg_err}")
+
+        serialized_donations = []
+        for d in result_donations:
+            try:
+                serialized_donations.append(to_pydantic(d, DonationResponse).model_dump(mode="json"))
+            except Exception as ser_err:
+                logger.warning(f"Error serializing donation {d.id}: {ser_err}")
+                serialized_donations.append({"id": str(d.id), "status": str(d.status.value if hasattr(d.status, 'value') else d.status)})
+
+        count = len(result_donations)
+        return {
+            "success": True,
+            "message": f"Successfully processed {count} receipt(s).",
+            "processed_count": count,
+            "donations": serialized_donations
+        }
+    except Exception as fatal_err:
+        logger.error(f"Fatal error in bulk_upload_screenshots: {fatal_err}", exc_info=True)
+        return {
+            "success": False,
+            "message": f"Bulk upload failed: {str(fatal_err)}",
+            "processed_count": 0,
+            "donations": []
+        }
 
 
 @router.get("", response_model=List[DonationResponse])

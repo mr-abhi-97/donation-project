@@ -1,4 +1,6 @@
-﻿import { NextResponse } from "next/server";
+import { NextResponse } from "next/server";
+
+export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
@@ -6,12 +8,19 @@ export async function GET() {
       cache: "no-store",
     });
     if (!res.ok) {
-      return NextResponse.json([], { status: res.status });
+      const errText = await res.text().catch(() => "Backend server error");
+      return NextResponse.json(
+        { error: true, message: `FastAPI error (${res.status}): ${errText}` },
+        { status: res.status }
+      );
     }
     const data = await res.json();
     return NextResponse.json(data);
-  } catch (error) {
+  } catch (error: any) {
     console.error("Backend Proxy Error:", error);
-    return NextResponse.json([], { status: 500 });
+    return NextResponse.json(
+      { error: true, message: error?.message || "Cannot connect to backend server on port 8000." },
+      { status: 502 }
+    );
   }
 }
