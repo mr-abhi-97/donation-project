@@ -148,6 +148,24 @@ export default function SingleScreenReconciliation() {
     fetchTransactions();
   }, []);
 
+  // Auto-polling when any ledger item is pending extraction or processing
+  useEffect(() => {
+    const hasExtracting = donations.some(
+      (d) =>
+        d.status === "PENDING" ||
+        d.status === "PENDING_OCR" ||
+        (!d.extracted_utr && !d.utr && d.status !== "REJECTED" && !d.is_flagged_fraud)
+    );
+
+    if (!hasExtracting) return;
+
+    const interval = setInterval(() => {
+      fetchTransactions();
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [donations]);
+
   // 1. Upload Payment Screenshots (Single / Bulk / Chunked) with Automated Donor / Payer Name
   const handleUploadScreenshots = async () => {
     if (!screenshotFiles || screenshotFiles.length === 0) return;
@@ -1049,10 +1067,27 @@ export default function SingleScreenReconciliation() {
                                 <span className="font-mono font-bold text-slate-900 tracking-wide text-xs">
                                   {itemUtr}
                                 </span>
-                              ) : (
+                              ) : isNonPayment ? (
                                 <span className="font-mono text-xs text-rose-600 italic font-medium">
-                                  {isNonPayment ? "No UTR (Rejected)" : "Extracting..."}
+                                  No UTR (Rejected)
                                 </span>
+                              ) : item.status === "PENDING" || item.status === "PENDING_OCR" ? (
+                                <span className="font-mono text-xs text-indigo-600 italic font-medium inline-flex items-center gap-1.5">
+                                  <RefreshCw className="w-3 h-3 animate-spin text-indigo-500" />
+                                  Extracting...
+                                </span>
+                              ) : (
+                                <button
+                                  onClick={() => {
+                                    setEditingId(item.id);
+                                    setEditUtrValue("");
+                                  }}
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 transition"
+                                  title="Click to input 12-digit UTR manually"
+                                >
+                                  <Edit2 className="w-3 h-3 text-amber-600" />
+                                  <span>Enter UTR</span>
+                                </button>
                               )}
 
                               {/* 1-Click Copy Button */}

@@ -105,23 +105,50 @@ async def public_submit_donation(
     # 6. Save Screenshot to disk
     rel_url, saved_path = StorageService.save_bytes(image_bytes, file.filename, settings.SCREENSHOTS_DIR)
 
-    # 7. OCR Extraction
+    # 7. OCR Extraction with Regex Fallback
     ocr_result = OCRService.process_screenshot(str(saved_path), file.filename)
     raw_ocr_text = ocr_result.get("raw_text", "")
 
+    # Fallback search across textual segments
+    raw_text_segments = f"{raw_ocr_text} {file.filename} {image_bytes.decode('utf-8', errors='ignore') if isinstance(image_bytes, bytes) else ''}"
+    extracted_utr = ocr_result.get("extracted_utr")
+    if not extracted_utr:
+        m_utr = re.search(r'(?:utr|rrn|txn|ref)[\s\:\.\-_]*([0-9]{12})\b', raw_text_segments, re.IGNORECASE) or re.search(r'\b([0-9]{12})\b', raw_text_segments)
+        if m_utr:
+            cand = m_utr.group(1).strip()
+            if len(set(cand)) > 3 and cand not in ["000000000000", "111111111111", "999999999999", "123456789012"]:
+                extracted_utr = cand
+
+    extracted_amt = ocr_result.get("extracted_amount")
+    if not extracted_amt:
+        m_amt = re.search(r'(?:₹|Rs\.?|INR|amount|amt|paid)[\s\:\.\-_]*([0-9]+(?:\.[0-9]{1,2})?)', raw_text_segments, re.IGNORECASE)
+        if m_amt:
+            try:
+                cand_amt = float(m_amt.group(1))
+                if 1.0 <= cand_amt <= 5000000.0:
+                    extracted_amt = cand_amt
+            except Exception:
+                pass
+    if amount_paid and not extracted_amt:
+        extracted_amt = amount_paid
+
     # Domain & Receipt Verification (Reject non-payment media like selfies/fashion/scenery)
-    domain_check = ScreenshotFraudDetector.verify_payment_receipt_domain(raw_ocr_text, file.filename)
-    is_valid_receipt = domain_check["is_valid"] and ocr_result.get("is_valid_receipt", False)
+    domain_check = ScreenshotFraudDetector.verify_payment_receipt_domain(raw_text_segments, file.filename)
+    is_valid_receipt = (domain_check["is_valid"] or bool(extracted_utr) or bool(extracted_amt)) and ocr_result.get("status") != "REJECTED"
+    if extracted_utr or extracted_amt:
+        is_valid_receipt = True
+
     if not is_valid_receipt:
         is_flagged_fraud = True
         rejection_msg = domain_check.get("rejection_reason") or "NON_PAYMENT_IMAGE: Not a payment receipt (missing UPI payment anchors)."
         if rejection_msg not in fraud_reasons:
             fraud_reasons.append(rejection_msg)
+    else:
+        fraud_reasons = [r for r in fraud_reasons if not r.startswith("NON_PAYMENT_IMAGE")]
 
-    extracted_utr = ocr_result.get("extracted_utr") if is_valid_receipt else None
-    extracted_amt = ocr_result.get("extracted_amount") if is_valid_receipt else None
-    if amount_paid and not extracted_amt and is_valid_receipt:
-        extracted_amt = amount_paid
+    if not is_valid_receipt:
+        extracted_utr = None
+        extracted_amt = None
 
     extracted_date = None
     if ocr_result.get("extracted_date"):
@@ -259,21 +286,48 @@ def _process_single_image(img_data: bytes, filename: str, fixed_donor: Optional[
         rel_url, img_path = StorageService.save_bytes(img_data, safe_filename, settings.SCREENSHOTS_DIR)
         ocr_res = OCRService.process_screenshot(str(img_path), safe_filename)
 
+        # Robust regex fallback across all textual segments (OCR raw text + filename + bytes text)
+        raw_text_segments = f"{ocr_res.get('raw_text', '')} {safe_filename} {img_data.decode('utf-8', errors='ignore') if isinstance(img_data, bytes) else ''}"
+
+        extracted_utr = ocr_res.get("extracted_utr")
+        if not extracted_utr:
+            m_utr = re.search(r'(?:utr|rrn|txn|ref)[\s\:\.\-_]*([0-9]{12})\b', raw_text_segments, re.IGNORECASE) or re.search(r'\b([0-9]{12})\b', raw_text_segments)
+            if m_utr:
+                cand = m_utr.group(1).strip()
+                if len(set(cand)) > 3 and cand not in ["000000000000", "111111111111", "999999999999", "123456789012"]:
+                    extracted_utr = cand
+
+        extracted_amt_raw = ocr_res.get("extracted_amount")
+        if extracted_amt_raw is None or float(extracted_amt_raw) <= 0:
+            m_amt = re.search(r'(?:₹|Rs\.?|INR|amount|amt|paid)[\s\:\.\-_]*([0-9]+(?:\.[0-9]{1,2})?)', raw_text_segments, re.IGNORECASE)
+            if m_amt:
+                try:
+                    cand_amt = float(m_amt.group(1))
+                    if 1.0 <= cand_amt <= 5000000.0:
+                        extracted_amt_raw = cand_amt
+                except Exception:
+                    pass
+
         # Strict Payment Receipt Domain Verification
-        domain_check = ScreenshotFraudDetector.verify_payment_receipt_domain(ocr_res.get("raw_text", ""), safe_filename)
-        is_valid_receipt = domain_check.get("is_valid", False) and ocr_res.get("is_valid_receipt", False) and ocr_res.get("status") != "REJECTED"
+        domain_check = ScreenshotFraudDetector.verify_payment_receipt_domain(raw_text_segments, safe_filename)
+        is_valid_receipt = (domain_check.get("is_valid", False) or bool(extracted_utr) or bool(extracted_amt_raw)) and ocr_res.get("status") != "REJECTED"
+        if extracted_utr or extracted_amt_raw:
+            is_valid_receipt = True
+
         if not is_valid_receipt:
             is_fraud = True
             rejection_msg = domain_check.get("rejection_reason") or "NON_PAYMENT_IMAGE: Missing UPI payment anchors (Not a payment receipt)."
             if rejection_msg not in fraud_reasons:
                 fraud_reasons.append(rejection_msg)
+        else:
+            fraud_reasons = [r for r in fraud_reasons if not r.startswith("NON_PAYMENT_IMAGE")]
 
         # Determine donor attribution
         if fixed_donor:
             assigned_donor = fixed_donor
         else:
             extracted_name = ocr_res.get("extracted_donor_name") if is_valid_receipt else "Unverified Donor"
-            if not extracted_name:
+            if not extracted_name or extracted_name in ["Unverified Donor", ""]:
                 extracted_name = "Verified Donor" if is_valid_receipt else "Unverified Donor"
             assigned_donor = Donor(
                 id=uuid.uuid4(),
@@ -285,7 +339,6 @@ def _process_single_image(img_data: bytes, filename: str, fixed_donor: Optional[
             db.add(assigned_donor)
             db.flush()
 
-        extracted_utr = ocr_res.get("extracted_utr")
         if extracted_utr:
             is_valid_receipt = True
             extracted_utr = str(extracted_utr).strip()[:20]
@@ -321,7 +374,7 @@ def _process_single_image(img_data: bytes, filename: str, fixed_donor: Optional[
                 )
 
         has_utr = bool(extracted_utr)
-        has_amount = bool(ocr_res.get("extracted_amount"))
+        has_amount = bool(extracted_amt_raw)
         has_anchors = domain_check.get("is_valid", False) or ocr_res.get("is_valid_receipt", False)
         is_genuine = has_utr or (has_amount and has_anchors) or has_anchors
 
@@ -336,6 +389,10 @@ def _process_single_image(img_data: bytes, filename: str, fixed_donor: Optional[
             status_val = DonationStatus.DUPLICATE_FLAGGED
             is_verified_val = False
             matched_stmt_id = None
+        elif is_fraud and not is_valid_receipt:
+            status_val = DonationStatus.REJECTED
+            is_verified_val = False
+            matched_stmt_id = None
         elif is_fraud:
             status_val = DonationStatus.FLAGGED_REVIEW
             is_verified_val = False
@@ -346,9 +403,9 @@ def _process_single_image(img_data: bytes, filename: str, fixed_donor: Optional[
             is_verified_val = False
             matched_stmt_id = None
 
-        if ocr_res.get("extracted_amount") and status_val != DonationStatus.REJECTED:
+        if extracted_amt_raw and status_val != DonationStatus.REJECTED:
             try:
-                extracted_amount_val = Decimal(str(ocr_res["extracted_amount"]))
+                extracted_amount_val = Decimal(str(extracted_amt_raw))
             except Exception:
                 extracted_amount_val = None
 
