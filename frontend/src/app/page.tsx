@@ -97,6 +97,7 @@ export default function SingleScreenReconciliation() {
   const [statementError, setStatementError] = useState<string>("");
   const [loadingLedger, setLoadingLedger] = useState(false);
   const [ledgerError, setLedgerError] = useState<string>("");
+  const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number; batch: number; totalBatches: number } | null>(null);
 
   const showNotification = (message: string, type: "success" | "info" | "error" = "info") => {
     setStatusNotification({ message, type });
@@ -147,56 +148,99 @@ export default function SingleScreenReconciliation() {
     fetchTransactions();
   }, []);
 
-  // 1. Upload Payment Screenshots (Single / Bulk) with Automated Donor / Payer Name
+  // 1. Upload Payment Screenshots (Single / Bulk / Chunked) with Automated Donor / Payer Name
   const handleUploadScreenshots = async () => {
     if (!screenshotFiles || screenshotFiles.length === 0) return;
     setLoadingScreenshots(true);
 
-    const formData = new FormData();
-    for (let i = 0; i < screenshotFiles.length; i++) {
-      formData.append("files", screenshotFiles[i]);
-    }
-    // If donorName was entered, pass it; otherwise omit so OCR extracts donor name automatically
-    if (donorName.trim()) {
-      formData.append("donor_name", donorName.trim());
+    const allFiles = Array.from(screenshotFiles);
+    const hasZip = allFiles.some((f) => f.name.toLowerCase().endsWith(".zip"));
+
+    // If a zip archive is included or count <= 4, process in single batch
+    // Otherwise, chunk into batches of 4 files for maximum speed, zero timeouts, and real-time progress
+    const CHUNK_SIZE = 4;
+    const batches: File[][] = [];
+
+    if (hasZip || allFiles.length <= CHUNK_SIZE) {
+      batches.push(allFiles);
+    } else {
+      for (let i = 0; i < allFiles.length; i += CHUNK_SIZE) {
+        batches.push(allFiles.slice(i, i + CHUNK_SIZE));
+      }
     }
 
-    try {
-      const res = await fetch("/api/donations/bulk-upload", {
-        method: "POST",
-        body: formData,
+    let totalProcessed = 0;
+    let anyMatched = false;
+    let anyFailed = false;
+
+    for (let bIndex = 0; bIndex < batches.length; bIndex++) {
+      const currentBatch = batches[bIndex];
+      setUploadProgress({
+        current: Math.min((bIndex + 1) * CHUNK_SIZE, allFiles.length),
+        total: allFiles.length,
+        batch: bIndex + 1,
+        totalBatches: batches.length,
       });
-      if (res.ok) {
-        const resultData = await res.json();
-        setScreenshotFiles(null);
-        setDonorName("");
-        // Reset file input
-        const input = document.getElementById("screenshot-input") as HTMLInputElement;
-        if (input) input.value = "";
-        
-        await fetchTransactions();
-        
-        const list: DonationItem[] = Array.isArray(resultData) ? resultData : (resultData?.donations || []);
-        const count = resultData?.processed_count ?? list.length;
-        
-        // Check if any uploaded screenshot instantly matched
-        const matchedUploaded = list.some((item: DonationItem) => item.is_verified || item.status === "MATCHED");
-        if (matchedUploaded) {
-          fireConfetti();
-          showNotification(`Processed ${count} receipt(s) — Bank statement match verified! 🟢`, "success");
-        } else {
-          showNotification(resultData?.message || `Successfully processed ${count} receipt(s). Forensic inspection complete.`, "info");
-        }
-      } else {
-        const errJson = await res.json().catch(() => null);
-        const errText = errJson?.message || await res.text().catch(() => "Unknown upload error");
-        showNotification(`Upload failed: ${errText}`, "error");
+
+      const formData = new FormData();
+      for (const file of currentBatch) {
+        formData.append("files", file);
       }
-    } catch (err) {
-      console.error("Screenshot upload failed", err);
-      showNotification("Screenshot upload failed. Please check network connection.", "error");
-    } finally {
-      setLoadingScreenshots(false);
+      if (donorName.trim()) {
+        formData.append("donor_name", donorName.trim());
+      }
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 120000);
+
+      try {
+        const res = await fetch("/api/donations/bulk-upload", {
+          method: "POST",
+          body: formData,
+          signal: controller.signal,
+        }).finally(() => clearTimeout(timeoutId));
+
+        if (res.ok) {
+          const resultData = await res.json();
+          const list: DonationItem[] = Array.isArray(resultData) ? resultData : (resultData?.donations || []);
+          const count = resultData?.processed_count ?? list.length;
+          totalProcessed += count;
+          if (list.some((item) => item.is_verified || item.status === "MATCHED")) {
+            anyMatched = true;
+          }
+          // Progressively refresh ledger after each chunk
+          await fetchTransactions();
+        } else {
+          anyFailed = true;
+          const errJson = await res.json().catch(() => null);
+          const errText = errJson?.message || await res.text().catch(() => "Batch upload error");
+          console.warn(`Batch ${bIndex + 1} upload notice:`, errText);
+        }
+      } catch (err: any) {
+        anyFailed = true;
+        console.error(`Batch ${bIndex + 1} failed:`, err);
+      }
+    }
+
+    setScreenshotFiles(null);
+    setDonorName("");
+    setUploadProgress(null);
+    setLoadingScreenshots(false);
+
+    const input = document.getElementById("screenshot-input") as HTMLInputElement;
+    if (input) input.value = "";
+
+    await fetchTransactions();
+
+    if (totalProcessed > 0) {
+      if (anyMatched) {
+        fireConfetti();
+        showNotification(`Successfully processed ${totalProcessed} receipt(s) — Bank statement match verified! 🟢`, "success");
+      } else {
+        showNotification(`Successfully processed ${totalProcessed} receipt(s). Forensic inspection complete.`, "info");
+      }
+    } else if (anyFailed) {
+      showNotification("Upload encountered errors. Please check backend connection.", "error");
     }
   };
 
@@ -579,7 +623,12 @@ export default function SingleScreenReconciliation() {
             >
               {loadingScreenshots ? (
                 <>
-                  <RefreshCw className="w-4 h-4 animate-spin"/> Running Forensics & OCR Extraction...
+                  <RefreshCw className="w-4 h-4 animate-spin"/>
+                  <span>
+                    {uploadProgress
+                      ? `Batch ${uploadProgress.batch}/${uploadProgress.totalBatches} (${uploadProgress.current}/${uploadProgress.total} receipts)...`
+                      : "Running Forensics & OCR Extraction..."}
+                  </span>
                 </>
               ) : (
                 <>
@@ -588,6 +637,15 @@ export default function SingleScreenReconciliation() {
                 </>
               )}
             </button>
+
+            {uploadProgress && (
+              <div className="w-full bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                <div
+                  className="bg-indigo-600 h-1.5 transition-all duration-300 rounded-full"
+                  style={{ width: `${Math.round((uploadProgress.batch / uploadProgress.totalBatches) * 100)}%` }}
+                />
+              </div>
+            )}
           </div>
 
           {/* Card 2: Bank Statement Upload */}

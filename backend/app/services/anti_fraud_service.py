@@ -86,6 +86,21 @@ class ScreenshotFraudDetector:
             }
 
     @staticmethod
+    def check_duplicate_utr(db, utr: str, current_donation_id=None):
+        """
+        Queries the database for existing donation records with the same UTR.
+        Returns the original Donation object if found, or None.
+        """
+        if not utr or not str(utr).strip():
+            return None
+        clean_utr = str(utr).strip()
+        from backend.app.models import Donation
+        query = db.query(Donation).filter(Donation.extracted_utr == clean_utr)
+        if current_donation_id is not None:
+            query = query.filter(Donation.id != current_donation_id)
+        return query.first()
+
+    @staticmethod
     def validate_utr_syntax(utr: str, allow_custom_id: bool = False) -> dict:
         r"""
         Validates UPI UTR / Auto-ID / AOTID / App Order ID transaction reference syntax:

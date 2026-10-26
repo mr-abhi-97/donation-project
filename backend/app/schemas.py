@@ -9,10 +9,20 @@ from backend.app.models import DonationStatus
 from backend.app.utils.validators import normalize_indian_phone, validate_pan_format
 
 
-def to_pydantic(model_cls, obj):
+def to_pydantic(a, b=None):
+    if b is None:
+        return a
+    if isinstance(a, type):
+        model_cls, obj = a, b
+    elif isinstance(b, type):
+        model_cls, obj = b, a
+    else:
+        model_cls, obj = a, b
     if hasattr(model_cls, 'model_validate'):
-        return model_cls.model_validate(obj)
-    return model_cls.from_orm(obj)
+        return model_cls.model_validate(obj, from_attributes=True)
+    if hasattr(model_cls, 'from_orm'):
+        return model_cls.from_orm(obj)
+    return obj
 
 
 class DonorBase(BaseModel):

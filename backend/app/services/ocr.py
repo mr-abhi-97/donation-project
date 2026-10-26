@@ -300,17 +300,20 @@ class PaymentScreenshotExtractor:
 
             # Qualification heuristics:
             # Genuine receipt if:
-            # 1. Extracted a valid 12-digit UTR and amount > 0, OR
-            # 2. Contains >= 2 payment anchors, OR
-            # 3. Contains >= 1 payment anchor along with a parsed reference or amount.
-            is_valid_receipt = (
-                (bool(extracted_utr) and extracted_amount > 0.0)
+            # 1. Extracted a valid UTR, OR
+            # 2. Extracted an amount > 0 along with at least 1 payment anchor / transaction word, OR
+            # 3. Contains >= 2 payment anchors, OR
+            # 4. Contains transaction completion indicators
+            has_tx_words = any(w in lower_text for w in ["paid", "completed", "successful", "transferred", "transfer", "debited", "credited", "upi", "utr", "txn", "rrn"])
+            is_valid_receipt = bool(
+                extracted_utr
+                or (extracted_amount > 0.0 and (keyword_hits >= 1 or has_tx_words))
                 or (keyword_hits >= 2)
-                or (keyword_hits >= 1 and (bool(extracted_utr) or extracted_amount > 0.0))
+                or (keyword_hits >= 1 and has_tx_words)
             )
 
             # Guard against zero-content / random photos
-            if is_valid_receipt and not extracted_utr and extracted_amount <= 0.0 and keyword_hits < 2:
+            if is_valid_receipt and not extracted_utr and extracted_amount <= 0.0 and keyword_hits < 2 and not has_tx_words:
                 is_valid_receipt = False
 
             is_custom_id = False
@@ -353,14 +356,16 @@ class PaymentScreenshotExtractor:
 
         # Tier 1: Explicit labeled patterns
         targeted_patterns = [
+            # High priority: exact 12 numeric digits directly following UPI/UTR labels
+            r"(?i)(?:UPI\s*(?:Transaction\s*ID|Ref(?:\s*(?:No|Num|ID|Number|NC|NA|RO))?)|UTR(?:\s*(?:No|Num|ID|Number))?|Bank\s*Ref(?:erence)?(?:\s*No)?|RRN|Transaction\s*ID|Txn\s*ID|Trans\s*ID|Payment\s*ID)[\s\:\.\-\#\/]*([0-9]{12})\b",
             # Standard UPI Ref / UTR / Txn ID
-            r"(?i)(?:UPI\s*(?:Transaction\s*ID|Ref(?:\s*(?:No|Num|ID|Number|NC|NA|RO))?)|UTR(?:\s*(?:No|Num|ID|Number))?|Bank\s*Ref(?:erence)?(?:\s*No)?|RRN|Transaction\s*ID|Txn\s*ID|Trans\s*ID)[\s\:\.\-]+([A-Za-z0-9]{8,24})",
+            r"(?i)(?:UPI\s*(?:Transaction\s*ID|Ref(?:\s*(?:No|Num|ID|Number|NC|NA|RO))?)|UTR(?:\s*(?:No|Num|ID|Number))?|Bank\s*Ref(?:erence)?(?:\s*No)?|RRN|Transaction\s*ID|Txn\s*ID|Trans\s*ID|Payment\s*ID)[\s\:\.\-\#\/]*([A-Za-z0-9]{8,24})",
             # Spaced digits after label: "UPI Ref No: 4289 1029 3812"
-            r"(?i)(?:UPI\s*Ref|UTR|RRN|Txn\s*ID|Trans\s*ID|Transaction\s*ID)[\s\:\.\-]+([0-9]{3,6}\s+[0-9]{3,6}(?:\s+[0-9]{3,6})?)",
+            r"(?i)(?:UPI\s*Ref|UTR|RRN|Txn\s*ID|Trans\s*ID|Transaction\s*ID|Payment\s*ID)[\s\:\.\-\#\/]*([0-9]{3,6}[\s\-\.][0-9]{3,6}(?:[\s\-\.][0-9]{3,6})?)",
             # Auto-ID / AOTID / Order IDs
-            r"(?i)(?:Auto[\s\-_]*ID|AOT[\s\-_]*ID|App\s*Order\s*(?:ID|No|Num)|Order\s*(?:ID|No|Num))[\s\:\.\-]+([A-Za-z0-9]{8,24})",
+            r"(?i)(?:Auto[\s\-_]*ID|AOT[\s\-_]*ID|App\s*Order\s*(?:ID|No|Num)|Order\s*(?:ID|No|Num))[\s\:\.\-\#\/]*([A-Za-z0-9]{8,24})",
             # Google transaction ID: "Google transaction ID CICAgLDDxLWIBg"
-            r"(?i)(?:Google\s*transaction\s*ID|Google\s*Txn\s*ID)[\s\:\.\-]+([A-Za-z0-9\-_]{8,24})",
+            r"(?i)(?:Google\s*transaction\s*ID|Google\s*Txn\s*ID)[\s\:\.\-\#\/]*([A-Za-z0-9\-_]{8,24})",
         ]
 
         for pat in targeted_patterns:
@@ -420,24 +425,26 @@ class PaymentScreenshotExtractor:
             return 0.0
 
         patterns = [
-            # Currency symbol prefixes (₹, ?, R, INR, Rs., Rs)
-            r"(?:[₹\?R]|INR|Rs\.?)\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]{1,2})?)",
-            # Payment labels: "Paid of 200.00", "Payment of R2,000", "Amount 500"
-            r"(?i)(?:paid|amount|transfer(?:red)?|payment)\s*(?:of)?\s*[:\-]?\s*(?:[₹\?R]|INR|Rs\.?)?\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]{1,2})?)",
+            # Currency symbol prefixes (₹, ?, R, INR, Rs., Rs, $, €)
+            r"(?:[₹\?R]|INR|Rs\.?)\s*([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?)",
+            # Standard numbers with currency symbol directly attached
+            r"(?:[₹\?R]|INR|Rs\.?)\s*([0-9]+(?:\.[0-9]{1,2})?)",
+            # Payment labels: "Paid of 200.00", "Payment of R2,000", "Amount 500", "Amount: 1,200"
+            r"(?i)(?:paid|amount|transfer(?:red)?|payment|debited|credited)\s*(?:of)?\s*[:\-]?\s*(?:[₹\?R]|INR|Rs\.?)?\s*([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?)",
             # Multiline: "Payment Successful \n 200" or "Completed \n 500.00"
-            r"(?i)(?:payment\s*successful|paid\s*successfully|completed)[\s\n\r]*([0-9]+(?:,[0-9]+)*(?:\.[0-9]{1,2})?)",
-            # Amount before completion word: "500.00 \n Completed" or "200 \n Successful"
-            r"(?i)\b([0-9]+(?:,[0-9]+)*(?:\.[0-9]{1,2})?)[\s\n\r]+(?:completed|successful|paid\s*successfully)",
+            r"(?i)(?:payment\s*successful|paid\s*successfully|completed|successful)[\s\n\r]*[:\-]?\s*(?:[₹\?R]|INR|Rs\.?)?\s*([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?)",
+            # Amount before completion word: "500.00 \n Completed" or "1,200 \n Successful"
+            r"(?i)\b([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?)[\s\n\r]+(?:completed|successful|paid\s*successfully)",
             # Line starting with decimal amount or currency (very common at top of receipt)
             r"(?m)^\s*(?:[₹\?R]|INR|Rs\.?)?\s*([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{2}))\s*$",
             # Amount before currency word: "200 \n Rupees Only"
-            r"([0-9]+(?:,[0-9]+)*(?:\.[0-9]{1,2})?)[\s\n\r]*(?:rupees|only)",
-            # Indian comma-separated currency values: 25,000 or 1,25,000.00 or 2,000
+            r"([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?)[\s\n\r]*(?:rupees|only)",
+            # Indian comma-separated currency values: 1,200 or 25,000 or 1,25,000.00 or 2,000
             r"\b([0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{2})?)\b",
             # Plain numbers following 'To' line on GPay/PhonePe receipts: "To Raise India Foundation \n 200"
-            r"(?i)to[\s\w\n\r]+[\n\r]\s*(?:[₹\?R]|INR|Rs\.?)?\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]{1,2})?)",
-            # Standalone line with round numbers (e.g. 200, 250, 500, 1000)
-            r"(?m)^\s*(?:[₹\?R]|INR|Rs\.?)?\s*([1-9][0-9]{1,4})\s*$",
+            r"(?i)to[\s\w\n\r]+[\n\r]\s*(?:[₹\?R]|INR|Rs\.?)?\s*([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?)",
+            # Standalone line with round numbers (e.g. 200, 250, 500, 1000, 1200)
+            r"(?m)^\s*(?:[₹\?R]|INR|Rs\.?)?\s*([1-9][0-9]{1,5})\s*$",
         ]
 
         candidates = []
@@ -583,7 +590,9 @@ class OCRService:
 
             extracted_utr = details.get("utr")
             extracted_amount = details.get("amount") if details.get("amount", 0) > 0 else None
-            donor_name = details.get("payer_name")
+            # If a valid UTR was extracted, treat as valid receipt
+            if extracted_utr:
+                is_valid = True
 
             if not is_valid:
                 return {
@@ -602,7 +611,7 @@ class OCRService:
                     "diagnostics": details,
                 }
 
-            status = "EXTRACTED" if extracted_utr else "FLAGGED_REVIEW"
+            status = "EXTRACTED" if extracted_utr else ("EXTRACTED" if extracted_amount else "FLAGGED_REVIEW")
 
             return {
                 "raw_text": details.get("raw_text", ""),

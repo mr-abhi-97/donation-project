@@ -285,8 +285,9 @@ def _process_single_image(img_data: bytes, filename: str, fixed_donor: Optional[
             db.add(assigned_donor)
             db.flush()
 
-        extracted_utr = ocr_res.get("extracted_utr") if is_valid_receipt else None
+        extracted_utr = ocr_res.get("extracted_utr")
         if extracted_utr:
+            is_valid_receipt = True
             extracted_utr = str(extracted_utr).strip()[:20]
             is_custom = ocr_res.get("is_custom_id", False)
             utr_syntax = ScreenshotFraudDetector.validate_utr_syntax(extracted_utr, allow_custom_id=is_custom)
@@ -319,8 +320,13 @@ def _process_single_image(img_data: bytes, filename: str, fixed_donor: Optional[
                     f"DUPLICATE_UTR: 12-digit UTR '{extracted_utr}' already exists in transaction {original_tx_id} (Hash: {original_tx_hash or 'N/A'}). Potential recycling fraud / duplicate submission."
                 )
 
+        has_utr = bool(extracted_utr)
+        has_amount = bool(ocr_res.get("extracted_amount"))
+        has_anchors = domain_check.get("is_valid", False) or ocr_res.get("is_valid_receipt", False)
+        is_genuine = has_utr or (has_amount and has_anchors) or has_anchors
+
         extracted_amount_val = None
-        if not is_valid_receipt or ocr_res.get("status") == "REJECTED":
+        if not is_genuine and ocr_res.get("status") == "REJECTED":
             status_val = DonationStatus.REJECTED
             is_verified_val = False
             matched_stmt_id = None
